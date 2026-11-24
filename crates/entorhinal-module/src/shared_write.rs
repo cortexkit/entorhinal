@@ -1,36 +1,22 @@
-//! Runs one shared write at a time while readers use already committed data.
-//! A worker thread keeps the SQLite transaction open while the async task asks
-//! the log to append the entry, resending it if the result is uncertain. Local
-//! changes commit only after the log confirms the append. If confirmation does
-//! not arrive before the time limit, or the log rejects the attempt as outdated
-//! or invalid, the local changes roll back.
+//! Routes identity writes to the installed hub or commits them locally when
+//! sharing is off. During native enable, bootstrap fences protect the snapshot.
 
-use super::{
-    log_client::{self, AppendRequest, EntryKind, LogError},
-    *,
-};
+use super::*;
 use entorhinal_core::agent::{AgentPrecheck, OperatorApproval};
 use entorhinal_core::{RegistryStore, SharedSettlement};
 use serde_json::Value;
-use std::{sync::atomic::Ordering, time::Duration};
+use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
 
 const DEADLINE: Duration = Duration::from_secs(25);
-const SETTLEMENT: Duration = Duration::from_secs(20);
-const SEND_WAIT: Duration = Duration::from_secs(1);
-const RESEND_DELAY: Duration = Duration::from_millis(100);
-const RETRIES: usize = 5;
 pub(super) const OPERATOR_BOUND: Duration = Duration::from_secs(270);
 
 pub(super) fn health_state(state: u64) -> &'static str {
     match state {
-        1 => "engram_key_unavailable",
-        2 => "not_member",
         3 => "identity_log_invariant",
         4 => "log_gap",
         5 => "log_verify_failed",
         6 => "apply_failed",
-        7 => "log_head_regressed",
         _ => "ok",
     }
 }
@@ -38,13 +24,10 @@ pub(super) fn health_state(state: u64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake_log::{Action, FailConnector, FakeLog};
-    use crate::log_client::{LogConnector, LogTransport, TransportError};
+    use crate::fake_log::FailConnector;
+    use crate::log_client::LogConnector;
     use serde_json::json;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    };
+    use std::sync::{atomic::Ordering, Arc, Mutex};
     use std::{
         future::Future,
         pin::Pin,
@@ -56,11 +39,6 @@ mod tests {
     // by an extra millisecond lets a due timer fire even if its deadline was
     // rounded up; this does not measure how long SQLite takes in real time.
     const TIMER_TICK: Duration = Duration::from_millis(1);
-    static DRAWS: AtomicUsize = AtomicUsize::new(0);
-    fn fixed_draw() -> Result<String, HandlerError> {
-        DRAWS.fetch_add(1, Ordering::SeqCst);
-        Ok("agent_0123456789abcdef".into())
-    }
     fn fixed_avatar() -> Result<entorhinal_core::agent::StoredAgentAvatar, HandlerError> {
         Ok(entorhinal_core::agent::StoredAgentAvatar {
             genome: "ab".repeat(16_384),
@@ -93,29 +71,6 @@ mod tests {
         );
     }
 
-    /// Keep the test's async task runnable until the specified log call occurs.
-    /// When all async tasks are waiting, Tokio can advance its paused clock to
-    /// the next timer even though SQLite is still running on a worker thread.
-    /// Yielding in this loop keeps database preparation from using simulated
-    /// time that the test reserves for waiting on the log.
-    async fn reach<F: Future, B: Future<Output = ()>>(mut write: Pin<&mut F>, barrier: B) {
-        let frozen = Instant::now();
-        tokio::pin!(barrier);
-        loop {
-            tokio::select! {
-                biased;
-                () = &mut barrier => break,
-                _ = &mut write => panic!("write finished before the expected log call"),
-                () = tokio::task::yield_now() => {},
-            }
-        }
-        assert_eq!(
-            Instant::now(),
-            frozen,
-            "SQLite preparation advanced the paused clock"
-        );
-    }
-
     async fn finish<F: Future>(mut write: Pin<&mut F>) -> F::Output {
         let frozen = Instant::now();
         let result = loop {
@@ -132,34 +87,6 @@ mod tests {
         result
     }
 
-    /// Advance past the request's deadline and poll the write so it can discard
-    /// its temporary SQLite changes. If it is not ready, advance by one resend
-    /// interval and poll again. Code that incorrectly gave the request more time
-    /// would then send another append, which the timestamp check rejects. Finally
-    /// let any database rollback finish while the simulated clock stays still.
-    async fn expire<F: Future>(mut write: Pin<&mut F>, tap: &Tap, bound: Instant) -> F::Output {
-        tokio::time::advance(bound.saturating_duration_since(Instant::now()) + TIMER_TICK).await;
-        let mut result = match write.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(result) => Some(result),
-            Poll::Pending => None,
-        };
-        if result.is_none() {
-            tokio::time::advance(RESEND_DELAY + TIMER_TICK).await;
-            result = match write.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-                Poll::Ready(result) => Some(result),
-                Poll::Pending => None,
-            };
-        }
-        assert!(
-            tap.sent_at.lock().unwrap().iter().all(|time| *time < bound),
-            "a resend started at or after settlement expiry"
-        );
-        match result {
-            Some(result) => result,
-            None => finish(write).await,
-        }
-    }
-
     struct Fixture {
         dir: PathBuf,
         descriptor: StorageDescriptor,
@@ -169,14 +96,6 @@ mod tests {
         fn new(label: &str, connector: Arc<dyn LogConnector>) -> Self {
             let (dir, descriptor) = crate::tests::scratch_descriptor(label);
             let handler = Self::handler(&descriptor, connector);
-            handler
-                .with_store(|s| {
-                    s.apply_entry("identity_log.enable", "{}", "test", None, |tx| {
-                        tx.execute("UPDATE identity_log_state SET state='enabled'", [])?;
-                        Ok(())
-                    })
-                })
-                .unwrap();
             handler
                 .with_store(|s| s.apply_entry("agent.cutover", "{}", "test", None, |_| Ok(())))
                 .unwrap();
@@ -209,11 +128,6 @@ mod tests {
                 },
             );
             handler
-        }
-        fn restart(&mut self, connector: Arc<dyn LogConnector>) {
-            self.handler.store.lock().unwrap().take();
-            crate::tests::allow_legacy_store(&self.descriptor);
-            self.handler = Self::handler(&self.descriptor, connector);
         }
         fn store(&self) -> RegistryStore {
             self.handler.with_store(|s| Ok(s.clone())).unwrap()
@@ -262,498 +176,6 @@ mod tests {
     fn agent(key: &str) -> Value {
         json!({"role":"assistant", "name":"Ada", "tag":"helper", "request_key":key})
     }
-    fn refusal(code: &str) -> Action {
-        Action::Refuse {
-            code: code.into(),
-            detail: None,
-        }
-    }
-
-    // Record append requests when they reach the log transport, so assertions
-    // inspect what was actually sent. To simulate another writer acting first,
-    // add a separate entry before handling the tested request. Its expected log
-    // head is then outdated, so head_moved reflects a real new log position.
-    struct Tap {
-        fake: FakeLog,
-        requests: Mutex<Vec<Value>>,
-        sent_at: Mutex<Vec<Instant>>,
-        races: AtomicUsize,
-        hang_after_race: AtomicBool,
-        race_entry: Mutex<Option<Vec<u8>>>,
-    }
-    impl Tap {
-        fn new(races: usize) -> Arc<Self> {
-            Arc::new(Self {
-                fake: FakeLog::default(),
-                requests: Mutex::new(vec![]),
-                sent_at: Mutex::new(vec![]),
-                races: AtomicUsize::new(races),
-                hang_after_race: AtomicBool::new(false),
-                race_entry: Mutex::new(None),
-            })
-        }
-        fn sends(&self) -> Vec<Value> {
-            self.requests.lock().unwrap().clone()
-        }
-    }
-    struct TapConnector(Arc<Tap>);
-    #[async_trait]
-    impl LogConnector for TapConnector {
-        async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
-            Ok(self.0.clone())
-        }
-    }
-    fn connector(tap: &Arc<Tap>) -> Arc<dyn LogConnector> {
-        Arc::new(TapConnector(tap.clone()))
-    }
-    #[async_trait]
-    impl LogTransport for Tap {
-        async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
-            let mut raced = false;
-            if method == log_client::APPEND {
-                self.requests.lock().unwrap().push(params.clone());
-                self.sent_at.lock().unwrap().push(Instant::now());
-                if self
-                    .races
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok()
-                {
-                    raced = true;
-                    let head = self.fake.head();
-                    let data = self
-                        .race_entry
-                        .lock()
-                        .unwrap()
-                        .take()
-                        .unwrap_or_else(|| br#"{"op":"project.shared","tables":{}}"#.to_vec());
-                    self.fake
-                        .client()
-                        .append(&AppendRequest {
-                            expected_head: head,
-                            entry_id: [(head + 1) as u8; 16],
-                            kind: EntryKind::Change,
-                            data,
-                        })
-                        .await
-                        .unwrap();
-                }
-            }
-            let result = self.fake.call(method, params).await;
-            if raced && self.hang_after_race.load(Ordering::SeqCst) {
-                for _ in 0..30 {
-                    self.fake.on_append(Action::Hang);
-                }
-            }
-            result
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cached_register_restart_precedes_lock_connector_and_pending() {
-        let tap = Tap::new(0);
-        let mut f = Fixture::new("write-cache", connector(&tap));
-        let root = f.dir.join("checkout");
-        let parent = f.dir.join("workers");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::create_dir(&parent).unwrap();
-        let request = json!({"projectId":"P","name":"P","roots":[crate::tests::canonical_test_path(root)],"derivedRootParents":[crate::tests::canonical_test_path(parent)],"requestKey":"key"});
-        let body = f.call("register", request.clone()).await.unwrap();
-        let image = f.image();
-        let fail = Arc::new(FailConnector::default());
-        f.restart(fail.clone());
-        let lock = f.handler.writer.lock().await;
-        let retry = ready(f.call("register", request)).unwrap();
-        assert_eq!(retry, body);
-        assert_eq!(f.pending(), 0);
-        assert_eq!(f.image(), image);
-        assert_eq!(fail.calls(), 0);
-        assert_eq!(
-            f.call("remove", json!({"projectId":"P","requestKey":"key"}))
-                .await
-                .unwrap_err()
-                .code,
-            "request_key_reused_across_ops"
-        );
-        drop(lock);
-        assert_eq!(tap.fake.head(), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn local_commit_clears_losing_attempts_but_keeps_current_and_future_slots() {
-        let tap = Tap::new(0);
-        let mut f = Fixture::new("shared-pending-cleanup", connector(&tap));
-        tap.fake.on_append(Action::Hold);
-        let received = Instant::now();
-        let mut x = Box::pin(f.call("register", register("X", "X")));
-        reach(x.as_mut(), tap.fake.wait_for_calls(2)).await;
-        assert_eq!(
-            expire(x.as_mut(), &tap, received + SETTLEMENT)
-                .await
-                .unwrap_err()
-                .code,
-            "engram_outcome_unknown"
-        );
-        assert_eq!(f.pending(), 1);
-        finish(std::pin::pin!(f.call("register", register("Y", "Y"))))
-            .await
-            .unwrap();
-        assert_eq!(tap.fake.head(), 1);
-        assert_eq!(f.pending(), 0);
-        assert_eq!(
-            ready(f.handler.health()).metrics.unwrap()["pendingWriteCount"],
-            0
-        );
-        let status: Value =
-            serde_json::from_slice(&ready(f.call("identity_log.status", json!({}))).unwrap())
-                .unwrap();
-        assert_eq!(status["result"]["pendingWriteCount"], 0);
-        // The earlier append, still held by the fake log, expected the head
-        // that Y's entry has since moved past, so the log refuses it.
-        assert!(tap.fake.release_next().is_err());
-        drop(x);
-        f.restart(connector(&tap));
-        assert_eq!(f.pending(), 0);
-        for head in [2, 3] {
-            let store = f.store();
-            let result = store.shared_attempt(
-                format!("future-{head}"),
-                head,
-                |_| SharedSettlement::Rollback {
-                    sent: true,
-                    code: "engram_outcome_unknown".into(),
-                    message: "unobserved attempt".into(),
-                },
-                || {
-                    store.with_principal("test").register_at(
-                        RegisterRequest {
-                            project_id: Some(format!("future-{head}")),
-                            name: "Future".into(),
-                            ..Default::default()
-                        },
-                        700,
-                    )
-                },
-            );
-            assert!(result.is_err());
-        }
-        finish(std::pin::pin!(f.call("register", register("Z", "Z"))))
-            .await
-            .unwrap();
-        assert_eq!(tap.fake.head(), 2);
-        assert_eq!(
-            f.pending(),
-            2,
-            "attempts at or beyond the committed position must survive"
-        );
-        assert_eq!(
-            ready(f.handler.health()).metrics.unwrap()["pendingWriteCount"],
-            2
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn dropped_write_keeps_writer_exclusion_until_blocking_commit_finishes() {
-        let tap = Tap::new(0);
-        let mut f = Fixture::new("shared-dropped-commit", connector(&tap));
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let release_rx = Mutex::new(release_rx);
-        let signal = entered.clone();
-        // Park only after the append's successful receipt has reached the
-        // blocking worker, but before that worker commits its transaction.
-        f.handler.shared_commit_hook = Some(Arc::new(move || {
-            signal.notify_one();
-            release_rx.lock().unwrap().recv().unwrap();
-        }));
-        let mut write = Box::pin(f.handler.write_wait(
-            WireRequest {
-                method: "register".into(),
-                params: register("once", "once"),
-            },
-            ROUTE,
-            Instant::now(),
-        ));
-        reach(write.as_mut(), entered.notified()).await;
-        assert_eq!(tap.fake.head(), 1);
-        drop(write);
-        let mut queued = Box::pin(f.handler.writer.lock());
-        let excluded = queued
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending();
-        drop(queued);
-        // Always release the worker before asserting, including on a broken
-        // exclusion implementation, so a failed test cannot strand a thread.
-        release_tx.send(()).unwrap();
-        let store = f.store();
-        let catch = async {
-            let _writer = f.handler.writer.lock().await;
-            f.handler.catch_up(&store, Instant::now() + DEADLINE).await
-        };
-        finish(std::pin::pin!(catch)).await.unwrap();
-        assert!(
-            excluded,
-            "dropping the request released exclusion before commit"
-        );
-        assert_eq!(
-            f.store()
-                .identity_log_status()
-                .unwrap()
-                .last_applied_position,
-            1
-        );
-        assert_eq!(f.store().enumerate(None).unwrap().projects.len(), 1);
-        assert_eq!(f.store().generation().unwrap(), 3);
-        assert_eq!(f.handler.health.log_state.load(Ordering::Relaxed), 0);
-        assert_eq!(f.pending(), 0);
-        assert_eq!(tap.sends().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn domain_and_oversize_refusals_restore_pending_journal_and_projection_on_restart() {
-        let tap = Tap::new(0);
-        let mut f = Fixture::new("write-refused", connector(&tap));
-        let image = f.image();
-        assert_eq!(
-            f.call("remove", json!({"projectId":"absent"}))
-                .await
-                .unwrap_err()
-                .code,
-            "not_found"
-        );
-        let error = f
-            .call(
-                "register",
-                json!({"projectId":"big","name":"x".repeat(300_000),"roots":[]}),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "shared_entry_too_large");
-        assert!(
-            error.message.contains("bytes; cap is 262144 bytes"),
-            "{}",
-            error.message
-        );
-        assert_eq!(f.pending(), 0);
-        assert_eq!(f.image(), image);
-        assert!(tap.sends().is_empty());
-        f.restart(connector(&tap));
-        assert_eq!(f.pending(), 0);
-        assert_eq!(f.image(), image);
-        assert_eq!(tap.fake.head(), 0);
-    }
-
-    #[tokio::test]
-    async fn empty_shared_comparison_commits_local_roots_without_append_or_pending() {
-        let tap = Tap::new(0);
-        let f = Fixture::new("write-empty", connector(&tap));
-        f.call("register", register("P", "first")).await.unwrap();
-        let root = f.dir.join("root");
-        std::fs::create_dir(&root).unwrap();
-        let root = crate::tests::canonical_test_path(root);
-        let before = f.store().generation().unwrap();
-        f.call(
-            "register",
-            json!({"projectId":"P","name":"P","roots":[root],"requestKey":"local"}),
-        )
-        .await
-        .unwrap();
-        assert!(f.store().generation().unwrap() > before);
-        assert_eq!(f.pending(), 0);
-        assert_eq!(tap.sends().len(), 1);
-        assert_eq!(tap.fake.head(), 1);
-        assert_eq!(f.store().enumerate(None).unwrap().projects.len(), 1);
-        assert!(f.store().verify().unwrap().ok);
-    }
-
-    #[tokio::test]
-    async fn lost_reply_resends_identical_bytes_id_and_stale_head_and_commits_once() {
-        let tap = Tap::new(0);
-        tap.fake.on_append(Action::DropReply);
-        let f = Fixture::new("write-lost", connector(&tap));
-        f.call("register", register("P", "lost")).await.unwrap();
-        let sends = tap.sends();
-        assert_eq!(sends.len(), 2);
-        assert_eq!(sends[0], sends[1]);
-        assert_eq!(sends[1]["expected_head"], 0);
-        assert_eq!(tap.fake.head(), 1);
-        assert_eq!(f.pending(), 0);
-        assert_eq!(
-            f.store()
-                .journal_tail(0, 100)
-                .unwrap()
-                .entries
-                .iter()
-                .filter(|e| e.op == "register")
-                .count(),
-            1
-        );
-        assert!(f.store().verify().unwrap().ok);
-    }
-
-    #[tokio::test]
-    async fn user_profile_shared_writer_retries_and_persists_original_reply_without_noop_append() {
-        let tap = Tap::new(0);
-        tap.fake.on_append(Action::DropReply);
-        let mut f = Fixture::new("user-profile-shared", connector(&tap));
-        let request =
-            json!({"field":"name","value":"Mira","actor":"Mira via core","request_key":"name"});
-        let reply = f.call("user.set", request.clone()).await.unwrap();
-        let sends = tap.sends();
-        assert_eq!(sends.len(), 2);
-        assert_eq!(sends[0], sends[1]);
-        let user: Value = serde_json::from_slice(
-            &log_client::decode_hex(sends[0]["entry"]["data"].as_str().unwrap()).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(user["op"], "user.set");
-        assert_eq!(user["value"], "Mira");
-        assert_eq!(user["actor"], "Mira via core");
-        assert_eq!(user["principal"], "reserved:prefrontal");
-        assert_eq!(tap.fake.head(), 1);
-        assert_eq!(f.pending(), 0);
-        f.restart(connector(&tap));
-        assert_eq!(f.call("user.set", request).await.unwrap(), reply);
-        assert_eq!(
-            f.call(
-                "user.set",
-                json!({"field":"name","value":"Mira","request_key":"noop"})
-            )
-            .await
-            .unwrap(),
-            reply
-        );
-        assert_eq!(tap.sends().len(), 2);
-        assert_eq!(tap.fake.head(), 1);
-        assert!(f.store().verify().unwrap().ok);
-    }
-
-    #[tokio::test]
-    async fn head_moved_uses_new_entry_id_but_agent_id_drawn_once_before_attempts() {
-        static AVATAR_DRAWS: AtomicUsize = AtomicUsize::new(0);
-        fn counting_avatar() -> Result<entorhinal_core::agent::StoredAgentAvatar, HandlerError> {
-            AVATAR_DRAWS.fetch_add(1, Ordering::SeqCst);
-            draw_agent_avatar()
-        }
-        DRAWS.store(0, Ordering::SeqCst);
-        let tap = Tap::new(1);
-        let mut f = Fixture::new("write-race", connector(&tap));
-        f.handler.agent_id_draw = fixed_draw;
-        f.handler.agent_avatar_draw = counting_avatar;
-        let body: Value =
-            serde_json::from_slice(&f.call("agent.create", agent("new-agent")).await.unwrap())
-                .unwrap();
-        assert_eq!(
-            body["result"]["agent"]["agent_id"],
-            "agent_0123456789abcdef"
-        );
-        assert_eq!(DRAWS.load(Ordering::SeqCst), 1);
-        assert_eq!(AVATAR_DRAWS.load(Ordering::SeqCst), 1);
-        let sends = tap.sends();
-        assert_eq!(sends.len(), 2);
-        assert_ne!(sends[0]["entry_id"], sends[1]["entry_id"]);
-        for send in sends {
-            let entry: Value = serde_json::from_slice(
-                &log_client::decode_hex(send["entry"]["data"].as_str().unwrap()).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(entry["agent_id"], "agent_0123456789abcdef");
-            assert_eq!(entry["row"]["created_at_ms"], 700);
-            assert_wild_avatar(&entry["row"]["avatar"]);
-            assert_eq!(
-                entry["row"]["avatar"]["genome"],
-                f.store().agent_snapshot().unwrap().agents[0]
-                    .avatar
-                    .as_ref()
-                    .unwrap()
-                    .genome
-            );
-        }
-        assert_eq!(f.pending(), 0);
-        assert_eq!(f.store().agent_snapshot().unwrap().agents.len(), 1);
-        assert!(f.store().verify().unwrap().ok);
-    }
-
-    #[tokio::test]
-    async fn avatar_create_lost_reply_resends_identical_bytes() {
-        let tap = Tap::new(0);
-        tap.fake.on_append(Action::DropReply);
-        let mut f = Fixture::new("avatar-create-lost", connector(&tap));
-        f.handler.agent_avatar_draw = draw_agent_avatar;
-        f.call("agent.create", agent("avatar-lost")).await.unwrap();
-        let sends = tap.sends();
-        assert_eq!(sends.len(), 2);
-        assert_eq!(sends[0], sends[1]);
-        let entry: Value = serde_json::from_slice(
-            &log_client::decode_hex(sends[0]["entry"]["data"].as_str().unwrap()).unwrap(),
-        )
-        .unwrap();
-        assert_wild_avatar(&entry["row"]["avatar"]);
-        assert_eq!(f.store().agent_changes(0, None).unwrap().entries.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn placement_facts_head_moved_uses_only_committed_entry_id_and_request_retry_adds_nothing(
-    ) {
-        let tap = Tap::new(0);
-        let mut f = Fixture::new("placement-head-moved", connector(&tap));
-        f.store()
-            .apply_entry("fixture.identity", "{}", "test", None, |tx| {
-                tx.execute(
-                    "INSERT INTO self_identity VALUES(1,?1,1)",
-                    ["01".repeat(16)],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        f.handler.operator_confirmer = Arc::new(crate::served_vectors::Approve {
-            summaries: Mutex::new(vec![]),
-        });
-        f.handler.route_admissions().insert(
-            ROUTE,
-            RouteAdmission::from_bind(Some(Principal::Direct), None),
-        );
-        f.call("placement.backfill", json!({})).await.unwrap();
-        f.handler.route_admissions().insert(
-            ROUTE,
-            RouteAdmission::from_bind(
-                Some(Principal::Reserved {
-                    module_id: WRITER_MODULE.into(),
-                }),
-                None,
-            ),
-        );
-        tap.races.store(1, Ordering::SeqCst);
-        let request = register("P", "placement-retry");
-        let first = f.call("register", request.clone()).await.unwrap();
-        let sends = tap.sends();
-        assert_eq!(sends.len(), 3);
-        assert_ne!(sends[1]["entry_id"], sends[2]["entry_id"]);
-        let page = f
-            .store()
-            .placement_read(Default::default(), "test")
-            .unwrap();
-        assert_eq!(page.facts.len(), 1);
-        let fact = page
-            .facts
-            .iter()
-            .find(|fact| fact.project_id == "P")
-            .unwrap();
-        assert_eq!(
-            fact.fact_id,
-            format!("e:{}:P", sends[2]["entry_id"].as_str().unwrap())
-        );
-        assert_eq!(f.call("register", request).await.unwrap(), first);
-        assert_eq!(
-            f.store()
-                .placement_read(Default::default(), "test")
-                .unwrap()
-                .facts,
-            page.facts
-        );
-        assert_eq!(tap.sends().len(), 3);
-        assert!(f.store().verify().unwrap().replay.ok);
-    }
 
     #[tokio::test]
     async fn create_defaults_are_atomic_explicit_avatars_win_and_entropy_failure_refuses() {
@@ -767,17 +189,8 @@ mod tests {
                 version: Some(1),
             })
         }
-        for enabled in [false, true] {
-            let log = Arc::new(FakeLog::default());
-            let mut f = Fixture::new("create-avatars", log.clone());
-            if !enabled {
-                f.store()
-                    .apply_entry("disable", "{}", "test", None, |tx| {
-                        tx.execute("UPDATE identity_log_state SET state='disabled'", [])?;
-                        Ok(())
-                    })
-                    .unwrap();
-            }
+        {
+            let mut f = Fixture::new("create-avatars", Arc::new(FailConnector::default()));
             f.handler.agent_avatar_draw = draw_agent_avatar;
             let created: Value =
                 serde_json::from_slice(&f.call("agent.create", agent("wild")).await.unwrap())
@@ -843,356 +256,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn five_retries_then_head_moved_refuses_identity_log_contended() {
-        let tap = Tap::new(6);
-        let f = Fixture::new("write-contended", connector(&tap));
-        assert_eq!(
-            f.call("agent.create", agent("contended"))
-                .await
-                .unwrap_err()
-                .code,
-            "identity_log_contended"
-        );
-        let sends = tap.sends();
-        assert_eq!(sends.len(), 6);
-        assert_eq!(
-            sends
-                .iter()
-                .map(|v| v["entry_id"].as_str().unwrap())
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            6
-        );
-        assert!(f.store().agent_snapshot().unwrap().agents.is_empty());
-        assert_eq!(tap.fake.head(), 6);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn ambiguous_resend_refusals_keep_pending_until_receipt_relative_bound_and_recovery() {
-        async fn case(code: Option<&str>, state: &str) {
-            let tap = Tap::new(0);
-            tap.fake.on_append(Action::Hold);
-            for _ in 0..30 {
-                tap.fake
-                    .on_append(code.map(refusal).unwrap_or(Action::Hang));
-            }
-            let mut f = Fixture::new(&format!("write-unknown-{state}"), connector(&tap));
-            // Pretend the module received this request 18 seconds ago. Only two
-            // seconds remain in its 20-second limit for confirming the append;
-            // starting that limit at the first send would give it extra time.
-            let received = Instant::now() - Duration::from_secs(18);
-            let bound = received + SETTLEMENT;
-            let result = {
-                let write = f.handler.write_wait(
-                    WireRequest {
-                        method: "register".into(),
-                        params: register("P", "unknown"),
-                    },
-                    ROUTE,
-                    received,
-                );
-                tokio::pin!(write);
-                reach(write.as_mut(), tap.fake.wait_for_calls(2)).await;
-                assert_eq!(tap.fake.held_count(), 1);
-                assert_eq!(tap.sends().len(), 1);
-                // Time out the held send, then permit the resend under the same id.
-                tokio::time::advance(SEND_WAIT + TIMER_TICK).await;
-                pending(write.as_mut());
-                tokio::time::advance(RESEND_DELAY + TIMER_TICK).await;
-                reach(write.as_mut(), tap.fake.wait_for_calls(3)).await;
-                assert_eq!(tap.sends().len(), 2);
-                if code.is_some() {
-                    // Each refusal must allow another resend before expiry,
-                    // even if SQLite has not finished an erroneous early rollback.
-                    tokio::time::advance(RESEND_DELAY + TIMER_TICK).await;
-                    pending(write.as_mut());
-                    assert_eq!(
-                        tap.sends().len(),
-                        3,
-                        "a resend refusal ended settlement early"
-                    );
-                }
-                expire(write.as_mut(), &tap, bound).await
-            };
-            assert_eq!(result.unwrap_err().code, "engram_outcome_unknown");
-            assert_eq!(f.pending(), 1);
-            assert_eq!(tap.fake.head(), 0);
-            assert!(f.store().enumerate(None).unwrap().projects.is_empty());
-            assert_eq!(
-                health_state(f.handler.health.log_state.load(Ordering::Relaxed)),
-                state
-            );
-            assert!(tap.sends().len() >= 2);
-            let sends = tap.sends();
-            assert!(sends.iter().all(|v| v == &sends[0]));
-            f.restart(connector(&tap));
-            f.handler
-                .catch_up(&f.store(), Instant::now() + Duration::from_secs(1))
-                .await
-                .unwrap();
-            assert_eq!(
-                f.pending(),
-                1,
-                "an unchanged head cannot settle an in-flight send"
-            );
-            assert_eq!(tap.fake.release_next().unwrap(), 1);
-            f.handler
-                .catch_up(&f.store(), Instant::now() + Duration::from_secs(1))
-                .await
-                .unwrap();
-            assert_eq!(f.pending(), 0);
-            assert_eq!(f.store().enumerate(None).unwrap().projects.len(), 1);
-            assert_eq!(
-                f.handler
-                    .health
-                    .log_own_entries_applied
-                    .load(Ordering::Relaxed),
-                1
-            );
-            assert!(f.store().verify().unwrap().ok);
-        }
-        // Run the cases one at a time because they share Tokio's paused clock.
-        // One case advancing time could otherwise expire another case's request
-        // while its worker thread is still doing database work.
-        case(Some("unavailable"), "ok").await;
-        case(Some("not_member"), "not_member").await;
-        case(Some("key_unavailable"), "engram_key_unavailable").await;
-        case(None, "ok").await;
-    }
-
-    /// engram accepts a keyed `agent.create`, but neither its receipt nor any
-    /// resend answers before settlement expires, so the local transaction rolls
-    /// back and the caller hears `engram_outcome_unknown`. Catch-up later
-    /// installs the agent from the log. A retry with the same key must then
-    /// get the original success, not a name conflict with its own agent.
-    #[tokio::test(start_paused = true)]
-    async fn audit_legacy_accepted_receipt_preserves_request_key() {
-        let tap = Tap::new(0);
-        tap.fake.on_append(Action::Hold);
-        for _ in 0..30 {
-            tap.fake.on_append(Action::Hang);
-        }
-        let mut f = Fixture::new("legacy-accepted-receipt", connector(&tap));
-        f.handler.agent_id_draw = fixed_draw;
-        let received = Instant::now() - Duration::from_secs(18);
-        let bound = received + SETTLEMENT;
-        let result = {
-            let write = f.handler.write_wait(
-                WireRequest {
-                    method: "agent.create".into(),
-                    params: agent("accepted"),
-                },
-                ROUTE,
-                received,
-            );
-            tokio::pin!(write);
-            reach(write.as_mut(), tap.fake.wait_for_calls(2)).await;
-            assert_eq!(tap.fake.held_count(), 1);
-            tokio::time::advance(SEND_WAIT + TIMER_TICK).await;
-            pending(write.as_mut());
-            tokio::time::advance(RESEND_DELAY + TIMER_TICK).await;
-            reach(write.as_mut(), tap.fake.wait_for_calls(3)).await;
-            expire(write.as_mut(), &tap, bound).await
-        };
-        assert_eq!(result.unwrap_err().code, "engram_outcome_unknown");
-        assert_eq!(f.pending(), 1);
-        assert!(f.store().agent_snapshot().unwrap().agents.is_empty());
-        f.restart(connector(&tap));
-        f.handler.agent_id_draw = fixed_draw;
-        assert_eq!(tap.fake.release_next().unwrap(), 1);
-        f.handler
-            .catch_up(&f.store(), Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert_eq!(f.pending(), 0);
-        assert_eq!(f.store().agent_snapshot().unwrap().agents.len(), 1);
-        let sends = tap.sends().len();
-        let body: Value = serde_json::from_slice(
-            &f.call("agent.create", agent("accepted"))
-                .await
-                .expect("a same-key retry after recovery returns the original reply"),
-        )
-        .unwrap();
-        assert_eq!(
-            body["result"]["agent"]["agent_id"],
-            "agent_0123456789abcdef"
-        );
-        assert_eq!(tap.sends().len(), sends, "the retry sent another entry");
-        assert_eq!(f.store().agent_snapshot().unwrap().agents.len(), 1);
-        assert!(f.store().verify().unwrap().ok);
-    }
-
-    struct Warning(Arc<Mutex<String>>);
-    impl tracing::Subscriber for Warning {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            struct Fields<'a>(&'a mut String);
-            impl tracing::field::Visit for Fields<'_> {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    self.0.push_str(&format!("{}={value:?};", field.name()));
-                }
-            }
-            if *event.metadata().level() == tracing::Level::WARN {
-                event.record(&mut Fields(&mut self.0.lock().unwrap()));
-            }
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
-    #[tokio::test]
-    async fn id_reused_rolls_back_warns_entry_id_sets_health_and_never_retries() {
-        let tap = Tap::new(0);
-        tap.fake.on_append(refusal("id_reused"));
-        let f = Fixture::new("write-invariant", connector(&tap));
-        let image = f.image();
-        let output = Arc::new(Mutex::new(String::new()));
-        let _subscriber = tracing::subscriber::set_default(Warning(output.clone()));
-        assert_eq!(
-            f.call("register", register("P", "bug"))
-                .await
-                .unwrap_err()
-                .code,
-            "identity_log_invariant"
-        );
-        assert_eq!(tap.sends().len(), 1);
-        assert_eq!(f.pending(), 1);
-        assert_eq!(f.image(), image);
-        assert_eq!(
-            health_state(f.handler.health.log_state.load(Ordering::Relaxed)),
-            "identity_log_invariant"
-        );
-        let sends = tap.sends();
-        let output = output.lock().unwrap();
-        assert!(
-            output.contains(sends[0]["entry_id"].as_str().unwrap()),
-            "{output}"
-        );
-        assert!(output.contains("identity log invariant"), "{output}");
-        assert_eq!(tap.fake.head(), 0);
-    }
-
-    struct HangConnect;
-    #[async_trait]
-    impl LogConnector for HangConnect {
-        async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
-            std::future::pending().await
-        }
-    }
-    #[tokio::test(start_paused = true)]
-    async fn queued_connecting_and_catchup_deadlines_are_receipt_relative_and_never_send() {
-        assert_eq!(DEADLINE, Duration::from_secs(25));
-        assert_eq!(SETTLEMENT, Duration::from_secs(20));
-        async fn case(label: &str, connector: Arc<dyn LogConnector>, lock: bool, code: &str) {
-            let f = Fixture::new(label, connector);
-            let _guard = if lock {
-                Some(f.handler.writer.lock().await)
-            } else {
-                None
-            };
-            let before = f.image();
-            let received = Instant::now() - Duration::from_secs(18);
-            let write = f.handler.write_wait(
-                WireRequest {
-                    method: "register".into(),
-                    params: register("P", "deadline"),
-                },
-                ROUTE,
-                received,
-            );
-            tokio::pin!(write);
-            pending(write.as_mut());
-            tokio::time::advance(Duration::from_secs(6)).await;
-            pending(write.as_mut());
-            assert_eq!(f.pending(), 0);
-            assert_eq!(f.image(), before);
-            tokio::time::advance(Duration::from_secs(1)).await;
-            tokio::time::sleep_until(received + DEADLINE).await;
-            let error = ready(write.as_mut()).unwrap_err();
-            assert_eq!(error.code, code);
-            assert_eq!(f.pending(), 0);
-            assert_eq!(f.image(), before);
-        }
-        let tap = Tap::new(0);
-        tap.fake.on_read(Action::Hang);
-        case(
-            "write-queued",
-            Arc::new(FailConnector::default()),
-            true,
-            "identity_log_contended",
-        )
-        .await;
-        case(
-            "write-connect",
-            Arc::new(HangConnect),
-            false,
-            "engram_unavailable",
-        )
-        .await;
-        case(
-            "write-catchup",
-            connector(&tap),
-            false,
-            "engram_unavailable",
-        )
-        .await;
-        assert_eq!(tap.fake.calls(), 1);
-        assert!(tap.sends().is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn settlement_expired_before_first_send_deletes_the_committed_pending_row() {
-        let tap = Tap::new(0);
-        let f = Fixture::new("write-never-sent", connector(&tap));
-        let before = f.image();
-        let error = f
-            .handler
-            .write_wait(
-                WireRequest {
-                    method: "register".into(),
-                    params: register("P", "never"),
-                },
-                ROUTE,
-                Instant::now() - SETTLEMENT,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "engram_unavailable");
-        assert_eq!(f.pending(), 0);
-        assert_eq!(f.image(), before);
-        assert!(tap.sends().is_empty());
-    }
-
-    #[tokio::test]
     async fn malformed_agent_cache_retry_keeps_strict_decode_and_enabling_fence() {
-        let tap = Tap::new(0);
-        let f = Fixture::new("write-agent-cache", connector(&tap));
+        let fail = Arc::new(FailConnector::default());
+        let f = Fixture::new("write-agent-cache", fail.clone());
         f.call("agent.create", agent("cache")).await.unwrap();
-        let calls = tap.fake.calls();
         let mut malformed = agent("cache");
         malformed["residence"] = json!("removed-field");
         assert_eq!(
             f.call("agent.create", malformed).await.unwrap_err().code,
             "invalid_request"
         );
-        assert_eq!(tap.fake.calls(), calls);
-        f.store()
-            .apply_entry("test.enabling", "{}", "test", None, |tx| {
-                tx.execute("UPDATE identity_log_state SET state='enabling'", [])?;
-                Ok(())
-            })
-            .unwrap();
+        let plan = "7b".repeat(16);
+        f.store().begin_hub_enable(&plan, &"ab".repeat(16)).unwrap();
         assert_eq!(
             f.call("agent.create", agent("cache"))
                 .await
@@ -1200,7 +275,7 @@ mod tests {
                 .code,
             "identity_log_enabling"
         );
-        assert_eq!(tap.fake.calls(), calls);
+        assert_eq!(fail.calls(), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1225,16 +300,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        // Register the checkout and its execution binding (the checkout identity
-        // used for approvals) with shared logging disabled. Turn logging back on
-        // before testing local writes, so their success cannot depend on a log
-        // connection. The fake connector fails if any operation tries to use it.
-        f.store()
-            .apply_entry("test.disabled", "{}", "test", None, |tx| {
-                tx.execute("UPDATE identity_log_state SET state='disabled'", [])?;
-                Ok(())
-            })
-            .unwrap();
+        // Register and bind the checkout before installing a hub base.
         f.store()
             .register(
                 serde_json::from_value(
@@ -1251,7 +317,10 @@ mod tests {
         }
         f.store()
             .apply_entry("identity_log.enable", "{}", "test", None, |tx| {
-                tx.execute("UPDATE identity_log_state SET state='enabled'", [])?;
+                tx.execute(
+                    "UPDATE identity_log_state SET state='enabled', hub_log_base=0, hub_ready=1",
+                    [],
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -1291,243 +360,6 @@ mod tests {
         assert_eq!(fail.calls(), 0);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn pending_commits_before_parked_transaction_and_reads_show_prewrite_state() {
-        let tap = Tap::new(0);
-        let f = Fixture::new("write-parked", connector(&tap));
-        let body: Value =
-            serde_json::from_slice(&f.call("agent.create", agent("first")).await.unwrap()).unwrap();
-        let id = body["result"]["agent"]["agent_id"].as_str().unwrap();
-        let generation = f.store().generation().unwrap();
-        tap.fake.on_append(Action::Hold);
-        let before_calls = tap.fake.calls();
-        let mut queued = Box::pin(f.call(
-            "agent.rename",
-            json!({"agent_id":id,"name":"Katherine","request_key":"queued-rename"}),
-        ));
-        let observe = async {
-            tap.fake.wait_for_calls(before_calls + 2).await;
-            assert!(
-                queued
-                    .as_mut()
-                    .poll(&mut Context::from_waker(Waker::noop()))
-                    .is_pending(),
-                "a second rename must yield while the shared append holds SQL"
-            );
-            assert_eq!(
-                f.pending(),
-                1,
-                "pending row must be visible outside the open write transaction"
-            );
-            for (op, params) in [
-                (
-                    "resolve",
-                    json!({"canonicalRoot":crate::tests::canonical_test_path(&f.dir)}),
-                ),
-                ("enumerate", json!({})),
-                ("placement.read", json!({})),
-                ("verify", json!({})),
-                ("agent.resolve", json!({"agent_id":id})),
-            ] {
-                let bytes = serde_json::to_vec(&json!({"method":op,"params":params})).unwrap();
-                let reply = ready(f.handler.handle_served_request(&bytes, ROUTE));
-                assert!(matches!(reply, HandlerOutcome::Response(_)), "{op}");
-            }
-            let health = ready(f.handler.health());
-            assert_eq!(health.metrics.unwrap()["generation"], generation);
-            assert_eq!(f.store().generation().unwrap(), generation);
-            assert_eq!(f.store().agent_row(id).unwrap().unwrap().name, "Ada");
-            tap.fake.release_next().unwrap();
-        };
-        let (result, ()) = tokio::join!(
-            f.call(
-                "agent.rename",
-                json!({"agent_id":id,"name":"Grace","request_key":"rename"})
-            ),
-            observe
-        );
-        result.unwrap();
-        assert_eq!(f.pending(), 0);
-        assert_eq!(f.store().agent_row(id).unwrap().unwrap().name, "Grace");
-        assert_eq!(tap.fake.head(), 2);
-        assert!(f.store().verify().unwrap().ok);
-        finish(queued.as_mut()).await.unwrap();
-        assert_eq!(f.store().agent_row(id).unwrap().unwrap().name, "Katherine");
-        assert_eq!(tap.fake.head(), 3);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn head_moved_then_ambiguous_append_does_not_restart_settlement_clock() {
-        let tap = Tap::new(1);
-        // Add another writer's entry first, so the initial append is refused with
-        // head_moved. Leave later append requests unanswered to verify that
-        // reading the new entry and retrying do not extend the original time limit.
-        tap.hang_after_race.store(true, Ordering::SeqCst);
-        let f = Fixture::new("write-race-deadline", connector(&tap));
-        let received = Instant::now() - Duration::from_secs(18);
-        let bound = received + SETTLEMENT;
-        let write = f.handler.write_wait(
-            WireRequest {
-                method: "register".into(),
-                params: register("P", "race"),
-            },
-            ROUTE,
-            received,
-        );
-        tokio::pin!(write);
-        reach(write.as_mut(), tap.fake.wait_for_calls(5)).await;
-        assert_eq!(tap.sends().len(), 2);
-        let result = expire(write.as_mut(), &tap, bound).await;
-        assert_eq!(result.unwrap_err().code, "engram_outcome_unknown");
-        assert_eq!(f.pending(), 1);
-        assert!(f.store().enumerate(None).unwrap().projects.is_empty());
-    }
-
-    #[tokio::test]
-    async fn add_root_head_moved_reuses_first_attempt_timestamps() {
-        let tap = Tap::new(0);
-        let f = Fixture::new("write-add-clock", connector(&tap));
-        f.call("register", register("P", "base")).await.unwrap();
-        tap.races.store(1, Ordering::SeqCst);
-        let root = f.dir.join("root");
-        std::fs::create_dir(&root).unwrap();
-        let root = crate::tests::canonical_test_path(root);
-        f.call(
-            "add_root",
-            json!({"projectId":"P","root":root,"label":"stable"}),
-        )
-        .await
-        .unwrap();
-        let sends = tap.sends();
-        assert_eq!(sends.len(), 3);
-        let entries: Vec<Value> = sends[1..]
-            .iter()
-            .map(|send| {
-                serde_json::from_slice(
-                    &log_client::decode_hex(send["entry"]["data"].as_str().unwrap()).unwrap(),
-                )
-                .unwrap()
-            })
-            .collect();
-        assert_eq!(entries[0], entries[1]);
-        assert_eq!(
-            entries[0]["tables"]["project_root_key"]["upsert"][0]["created_at"],
-            700
-        );
-        for row in f
-            .store()
-            .journal_tail(0, 100)
-            .unwrap()
-            .entries
-            .iter()
-            .filter(|e| matches!(e.op.as_str(), "add_root" | "root_key.assign"))
-        {
-            assert_eq!(row.created_at, 700);
-        }
-        assert_eq!(f.pending(), 0);
-        assert!(f.store().verify().unwrap().ok);
-    }
-
-    #[tokio::test]
-    async fn refresh_root_key_uses_shared_writer_and_retries_without_rebinding() {
-        let tap = Tap::new(0);
-        let f = Fixture::new("write-refresh-key", connector(&tap));
-        f.handler
-            .store
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .set_root_records(true);
-        f.call("register", register("P", "base")).await.unwrap();
-        let root = f.dir.join("root");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::write(root.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
-        let root = crate::tests::canonical_test_path(root)
-            .to_string_lossy()
-            .into_owned();
-        f.call("add_root", json!({"projectId":"P","root":root}))
-            .await
-            .unwrap();
-        f.store().approve_root(&root, "test").unwrap();
-        let before = f
-            .store()
-            .trust(&root)
-            .unwrap()
-            .root_fields
-            .unwrap()
-            .root_records
-            .remove(0);
-        std::fs::write(
-            PathBuf::from(&root).join(".git/config"),
-            "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = git@github.com:o/r.git\n",
-        )
-        .unwrap();
-        let sends_before = tap.sends().len();
-        let generation = f.store().generation().unwrap();
-        tap.races.store(1, Ordering::SeqCst);
-        let reply: Value = serde_json::from_slice(
-            &f.call("refresh_root_key", json!({"root":root}))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(reply["result"]["rootKey"]["rootKey"], "o/r");
-        assert_eq!(reply["result"]["noop"], false);
-        let sends = tap.sends();
-        assert_eq!(sends.len(), sends_before + 2);
-        let entries: Vec<Value> = sends[sends_before..]
-            .iter()
-            .map(|send| {
-                serde_json::from_slice(
-                    &log_client::decode_hex(send["entry"]["data"].as_str().unwrap()).unwrap(),
-                )
-                .unwrap()
-            })
-            .collect();
-        assert_eq!(entries[0], entries[1]);
-        assert_eq!(
-            entries[0]["tables"]["project_root_key"]["upsert"][0]["root_key"],
-            "o/r"
-        );
-        assert_eq!(
-            entries[0]["tables"]["project_root_key"]["upsert"][0]["created_at"],
-            700
-        );
-        for table in ["project_root", "root_binding", "root_approval"] {
-            assert!(entries[0]["tables"].get(table).is_none());
-        }
-        let rows = f.store().journal_tail(generation, 100).unwrap().entries;
-        assert!(rows.iter().all(|row| row.op != "bind_root"));
-        let assignments: Vec<_> = rows
-            .into_iter()
-            .filter(|row| row.op == "root_key.assign")
-            .map(|row| (row.op, row.created_at))
-            .collect();
-        assert_eq!(assignments, vec![("root_key.assign".into(), 700)]);
-        let after = f
-            .store()
-            .trust(&root)
-            .unwrap()
-            .root_fields
-            .unwrap()
-            .root_records
-            .remove(0);
-        assert_eq!(before.registration_epoch, after.registration_epoch);
-        assert_eq!(after.approval.state, "approved");
-        let image = f.image();
-        let reply: Value = serde_json::from_slice(
-            &f.call("refresh_root_key", json!({"root":root}))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(reply["result"]["noop"], true);
-        assert_eq!(image, f.image());
-        assert_eq!(tap.sends().len(), sends.len());
-        assert_eq!(f.pending(), 0);
-        assert!(f.store().verify().unwrap().ok);
-    }
     mod confirmation {
         use super::*;
         use crate::agent_ops::{OperatorConfirmError, OperatorConfirmer};
@@ -1574,12 +406,9 @@ mod tests {
                 rx.await.unwrap_or(Err(OperatorConfirmError::Declined))
             }
         }
-        fn direct(f: &mut Fixture, prompt: Arc<Prompt>, enabled: bool) {
+        fn direct(f: &mut Fixture, prompt: Arc<Prompt>) {
             f.handler.operator_confirmer = prompt;
             bind(f);
-            if !enabled {
-                state(f, "disabled");
-            }
         }
         fn bind(f: &Fixture) {
             f.handler.route_admissions().insert(
@@ -1671,12 +500,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn confirmed_methods_pin_summaries_local_attribution_and_shared_bytes() {
-            for enabled in [false, true] {
-                let tap = Tap::new(0);
-                let mut f = Fixture::new("confirmed-summaries", connector(&tap));
+        async fn confirmed_methods_pin_summaries_and_local_attribution() {
+            {
+                let mut f = Fixture::new("confirmed-summaries", Arc::new(FailConnector::default()));
                 let prompt = Prompt::new(Some(Ok(())));
-                direct(&mut f, prompt.clone(), enabled);
+                direct(&mut f, prompt.clone());
                 f.handler.agent_id_draw = stable_draw;
                 let mut params = new_request("create");
                 params["tag"] = json!("q\"\\\né");
@@ -1723,13 +551,6 @@ mod tests {
                     serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap(),
                     serde_json::to_value(snapshot).unwrap()
                 );
-                for send in tap.sends() {
-                    let bytes =
-                        log_client::decode_hex(send["entry"]["data"].as_str().unwrap()).unwrap();
-                    assert!(!String::from_utf8(bytes)
-                        .unwrap()
-                        .contains("operator_confirmed"));
-                }
             }
         }
 
@@ -1745,11 +566,11 @@ mod tests {
 
         #[tokio::test]
         async fn carrying_placement_prompts_exactly_and_cached_reply_is_unchanged() {
-            for enabled in [false, true] {
-                let tap = Tap::new(0);
-                let mut f = Fixture::new("carry-confirmed", connector(&tap));
+            {
+                let fail = Arc::new(FailConnector::default());
+                let mut f = Fixture::new("carry-confirmed", fail.clone());
                 let prompt = Prompt::new(Some(Ok(())));
-                direct(&mut f, prompt.clone(), enabled);
+                direct(&mut f, prompt.clone());
                 write(&f, "register", json!({"projectId":"empty","name":"Empty","roots":[],"workspaceId":"W1","requestKey":"empty"})).await.unwrap();
                 assert_eq!(prompt.count(), 0);
                 placed_head(&f).await;
@@ -1786,10 +607,10 @@ mod tests {
 
         #[tokio::test]
         async fn carrying_refusals_precede_prompt_and_sync_direct_requires_approval() {
-            let tap = Tap::new(0);
-            let mut f = Fixture::new("carry-refusals", connector(&tap));
+            let fail = Arc::new(FailConnector::default());
+            let mut f = Fixture::new("carry-refusals", fail.clone());
             let prompt = Prompt::new(Some(Ok(())));
-            direct(&mut f, prompt.clone(), false);
+            direct(&mut f, prompt.clone());
             let moving = placed_head(&f).await;
             f.call(
                 "register",
@@ -1848,10 +669,10 @@ mod tests {
 
         #[tokio::test]
         async fn carrying_approval_rechecks_summary_under_writer_lock() {
-            let tap = Tap::new(0);
-            let mut f = Fixture::new("carry-stale", connector(&tap));
+            let fail = Arc::new(FailConnector::default());
+            let mut f = Fixture::new("carry-stale", fail.clone());
             let prompt = Prompt::new(None);
-            direct(&mut f, prompt.clone(), false);
+            direct(&mut f, prompt.clone());
             let moving = placed_head(&f).await;
             let mut waiting = Box::pin(write(
                 &f,
@@ -1882,7 +703,7 @@ mod tests {
                 let mut f =
                     Fixture::new("confirmation-refused", Arc::new(FailConnector::default()));
                 let prompt = Prompt::new(Some(Err(error)));
-                direct(&mut f, prompt.clone(), false);
+                direct(&mut f, prompt.clone());
                 let before = image(&f);
                 for _ in 0..2 {
                     let result = write(&f, "agent.create", new_request("refused"))
@@ -1904,11 +725,11 @@ mod tests {
 
         #[tokio::test]
         async fn prechecks_replay_and_domain_refusals_do_not_wait_for_writer_or_prompt() {
-            for enabled in [false, true] {
-                let tap = Tap::new(0);
-                let mut f = Fixture::new("confirmation-precheck", connector(&tap));
+            {
+                let mut f =
+                    Fixture::new("confirmation-precheck", Arc::new(FailConnector::default()));
                 let prompt = Prompt::new(Some(Ok(())));
-                direct(&mut f, prompt.clone(), enabled);
+                direct(&mut f, prompt.clone());
                 let landed = write(&f, "agent.create", new_request("landed"))
                     .await
                     .unwrap();
@@ -2041,7 +862,7 @@ mod tests {
                 Arc::new(FailConnector::default()),
             );
             let prompt = Prompt::new(Some(Ok(())));
-            direct(&mut f, prompt.clone(), false);
+            direct(&mut f, prompt.clone());
             // Literal escaped prefix, followed by a multibyte tag and an
             // interior newline (trailing whitespace would be trimmed).
             let prefix = "create assistant agent \"Ada\" with tag \"";
@@ -2087,12 +908,13 @@ mod tests {
 
         #[tokio::test]
         async fn relay_bytes_are_unchanged_and_unconfirmed_seams_stay_closed() {
-            let tap = Tap::new(0);
-            let other = Tap::new(0);
-            let mut f = Fixture::new("confirmation-relay", connector(&tap));
-            let mut baseline = Fixture::new("confirmation-relay-baseline", connector(&other));
+            let mut f = Fixture::new("confirmation-relay", Arc::new(FailConnector::default()));
+            let mut baseline = Fixture::new(
+                "confirmation-relay-baseline",
+                Arc::new(FailConnector::default()),
+            );
             let prompt = Prompt::new(Some(Err(OperatorConfirmError::Declined)));
-            direct(&mut f, prompt.clone(), true);
+            direct(&mut f, prompt.clone());
             f.handler.agent_id_draw = stable_draw;
             baseline.handler.agent_id_draw = stable_draw;
             for (op, params) in
@@ -2163,11 +985,11 @@ mod tests {
 
         #[tokio::test]
         async fn prompt_holds_no_locks_and_revalidation_catches_name_and_placement_changes() {
-            for (enabled, change) in [(false, "name"), (true, "name"), (false, "placement")] {
-                let tap = Tap::new(0);
-                let mut f = Fixture::new("confirmation-unlocked", connector(&tap));
+            for change in ["name", "placement"] {
+                let fail = Arc::new(FailConnector::default());
+                let mut f = Fixture::new("confirmation-unlocked", fail.clone());
                 let prompt = Prompt::new(None);
-                direct(&mut f, prompt.clone(), enabled);
+                direct(&mut f, prompt.clone());
                 let params = if change == "placement" {
                     f.call("register", json!({"projectId":"P","name":"P","workspaceId":"W1","roots":[],"requestKey":"P"})).await.unwrap();
                     json!({"role":"head","name":"Ada","tag":"ok","project_id":"P","request_key":"direct"})
@@ -2210,7 +1032,7 @@ mod tests {
         async fn busy_slot_survives_approval_and_releases_on_finish_drop_and_deadline() {
             let mut f = Fixture::new("confirmation-busy", Arc::new(FailConnector::default()));
             let prompt = Prompt::new(None);
-            direct(&mut f, prompt.clone(), false);
+            direct(&mut f, prompt.clone());
             let mut first = Box::pin(write(&f, "agent.create", new_request("first")));
             pending(first.as_mut());
             assert_eq!(
@@ -2264,10 +1086,10 @@ mod tests {
         #[tokio::test]
         async fn route_closure_wins_ready_prompt_and_lock_and_admission_slot_gap() {
             for stage in ["prompt", "lock", "admission"] {
-                let tap = Tap::new(0);
-                let mut f = Fixture::new("confirmation-route-close", connector(&tap));
+                let fail = Arc::new(FailConnector::default());
+                let mut f = Fixture::new("confirmation-route-close", fail.clone());
                 let prompt = Prompt::new(None);
-                direct(&mut f, prompt.clone(), true);
+                direct(&mut f, prompt.clone());
                 let barrier = Arc::new(tokio::sync::Barrier::new(2));
                 if stage == "admission" {
                     f.handler.confirmation_admission_barrier = Some(barrier.clone());
@@ -2293,7 +1115,7 @@ mod tests {
                 assert_eq!(first.await.unwrap_err().code, "operator_declined");
                 assert_eq!(prompt.count(), if stage == "admission" { 0 } else { 1 });
                 assert_eq!(image(&f), before);
-                assert!(tap.sends().is_empty());
+                assert_eq!(fail.calls(), 0);
                 f.handler.confirmation_admission_barrier = None;
                 bind(&f);
                 let count = prompt.count();
@@ -2307,74 +1129,45 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn approval_starts_stage_deadlines_and_late_approval_is_clamped() {
-            for (stage, late, enabled) in [
-                ("lock", false, true),
-                ("connect", false, true),
-                ("catchup", false, true),
-                ("unsent", false, true),
-                ("lock", true, true),
-                ("lock", true, false),
-            ] {
-                let tap = Tap::new(0);
-                if stage == "catchup" {
-                    tap.fake.on_read(Action::Hang);
-                }
-                let connector = if stage == "connect" {
-                    Arc::new(HangConnect) as Arc<dyn LogConnector>
-                } else {
-                    connector(&tap)
-                };
-                let mut f = Fixture::new("confirmation-stage-deadline", connector);
+            for late in [false, true] {
+                let mut f = Fixture::new(
+                    "confirmation-stage-deadline",
+                    Arc::new(FailConnector::default()),
+                );
                 let prompt = Prompt::new(None);
-                direct(&mut f, prompt.clone(), enabled);
+                direct(&mut f, prompt.clone());
                 let received = Instant::now();
                 let mut first = Box::pin(write(&f, "agent.create", new_request("deadline")));
                 pending(first.as_mut());
                 tokio::time::advance(Duration::from_secs(if late { 260 } else { 30 })).await;
                 let approval = Instant::now();
-                let lock = if matches!(stage, "lock" | "unsent") {
-                    Some(f.handler.writer.clone().lock_owned().await)
-                } else {
-                    None
-                };
+                let lock = f.handler.writer.clone().lock_owned().await;
                 let before = image(&f);
                 prompt.answer(0);
                 pending(first.as_mut());
                 let bound =
                     (approval + Duration::from_secs(25)).min(received + Duration::from_secs(270));
-                if stage == "unsent" {
-                    tokio::time::advance(Duration::from_secs(20) + TIMER_TICK).await;
-                    drop(lock);
-                    assert_eq!(
-                        finish(first.as_mut()).await.unwrap_err().code,
-                        "engram_unavailable"
-                    );
-                } else {
-                    tokio::time::advance(
-                        bound.saturating_duration_since(Instant::now()) - Duration::from_secs(1),
-                    )
-                    .await;
-                    pending(first.as_mut());
-                    tokio::time::advance(Duration::from_secs(1) + TIMER_TICK).await;
-                    assert_eq!(
-                        ready(first.as_mut()).unwrap_err().code,
-                        if stage == "lock" {
-                            "identity_log_contended"
-                        } else {
-                            "engram_unavailable"
-                        }
-                    );
-                }
+                tokio::time::advance(
+                    bound.saturating_duration_since(Instant::now()) - Duration::from_secs(1),
+                )
+                .await;
+                pending(first.as_mut());
+                tokio::time::advance(Duration::from_secs(1) + TIMER_TICK).await;
+                assert_eq!(
+                    ready(first.as_mut()).unwrap_err().code,
+                    "identity_log_contended"
+                );
+                drop(lock);
                 assert_eq!(prompt.count(), 1);
                 assert_eq!(image(&f), before);
-                assert!(tap.sends().is_empty());
             }
-            // An approval later than the old receipt-relative catch-up budget
-            // must still have a fresh budget and be able to land.
-            let tap = Tap::new(0);
-            let mut f = Fixture::new("confirmation-delayed-success", connector(&tap));
+            // A late approval still gets a fresh write budget.
+            let mut f = Fixture::new(
+                "confirmation-delayed-success",
+                Arc::new(FailConnector::default()),
+            );
             let prompt = Prompt::new(None);
-            direct(&mut f, prompt.clone(), true);
+            direct(&mut f, prompt.clone());
             let mut first = Box::pin(write(&f, "agent.create", new_request("delayed")));
             pending(first.as_mut());
             tokio::time::advance(Duration::from_secs(30)).await;
@@ -2382,154 +1175,6 @@ mod tests {
             finish(first.as_mut()).await.unwrap();
             assert_eq!(rows(&f).len(), 1);
         }
-
-        #[tokio::test(start_paused = true)]
-        async fn recovered_append_loses_local_approval_but_lost_reply_resend_retains_it() {
-            for late in [false, true] {
-                let tap = Tap::new(0);
-                tap.fake.on_append(Action::DropReply);
-                for _ in 0..300 {
-                    tap.fake.on_append(Action::Hang);
-                }
-                let mut f = Fixture::new("confirmation-recovered", connector(&tap));
-                let prompt = Prompt::new(None);
-                direct(&mut f, prompt.clone(), true);
-                let received = Instant::now();
-                let mut first = Box::pin(write(&f, "agent.create", new_request("unknown")));
-                pending(first.as_mut());
-                tokio::time::advance(Duration::from_secs(if late { 260 } else { 30 })).await;
-                let approval = Instant::now();
-                prompt.answer(0);
-                reach(first.as_mut(), tap.fake.wait_for_calls(2)).await;
-                assert_eq!(tap.fake.head(), 1);
-                let bound =
-                    (approval + Duration::from_secs(20)).min(received + Duration::from_secs(270));
-                assert_eq!(
-                    expire(first.as_mut(), &tap, bound).await.unwrap_err().code,
-                    "engram_outcome_unknown"
-                );
-                drop(first);
-                assert!(rows(&f).is_empty());
-                assert_eq!(f.pending(), 1);
-                assert!(f.store().agent_snapshot().unwrap().agents.is_empty());
-                finish(std::pin::pin!(f
-                    .handler
-                    .catch_up(&f.store(), Instant::now() + DEADLINE)))
-                .await
-                .unwrap();
-                let row = rows(&f).pop().unwrap();
-                assert_eq!(row.actor, "log");
-                assert_eq!(row.principal.as_deref(), Some("entorhinal"));
-                assert!(!row.payload_json.contains("operator_confirmed"));
-                assert_eq!(f.pending(), 0);
-                assert_eq!(prompt.count(), 1);
-                let snapshot = f.store().agent_snapshot().unwrap();
-                finish(std::pin::pin!(f
-                    .handler
-                    .catch_up(&f.store(), Instant::now() + DEADLINE)))
-                .await
-                .unwrap();
-                assert_eq!(
-                    serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap(),
-                    serde_json::to_value(snapshot).unwrap()
-                );
-            }
-            let tap = Tap::new(0);
-            tap.fake.on_append(Action::DropReply);
-            let mut f = Fixture::new("confirmation-resend", connector(&tap));
-            let prompt = Prompt::new(Some(Ok(())));
-            direct(&mut f, prompt.clone(), true);
-            let mut first = Box::pin(write(&f, "agent.create", new_request("lost")));
-            reach(first.as_mut(), tap.fake.wait_for_calls(2)).await;
-            tokio::time::advance(RESEND_DELAY + TIMER_TICK).await;
-            finish(first.as_mut()).await.unwrap();
-            assert_eq!(tap.sends().len(), 2);
-            assert_eq!(tap.sends()[0], tap.sends()[1]);
-            let row = rows(&f).pop().unwrap();
-            assert_eq!(row.principal.as_deref(), Some("direct"));
-            assert_eq!(
-                serde_json::from_str::<Value>(&row.payload_json).unwrap()["operator_confirmed"],
-                true
-            );
-            assert_eq!(prompt.count(), 1);
-            assert_eq!(f.pending(), 0);
-        }
-
-        #[tokio::test]
-        async fn retry_catchup_renaming_target_invalidates_approval_without_reprompting() {
-            let tap = Tap::new(0);
-            let mut f = Fixture::new("confirmation-retry-stale", connector(&tap));
-            let prompt = Prompt::new(Some(Ok(())));
-            direct(&mut f, prompt.clone(), true);
-            f.handler.agent_id_draw = stable_draw;
-            f.call("agent.create", new_request("seed")).await.unwrap();
-            // Build the competing entry through the real core mutation and
-            // shared encoder, not by computing an expected summary ourselves.
-            let remote = Tap::new(0);
-            let mut peer = Fixture::new("confirmation-retry-peer", connector(&remote));
-            peer.handler.agent_id_draw = stable_draw;
-            peer.call("agent.create", new_request("seed"))
-                .await
-                .unwrap();
-            peer.call(
-                "agent.rename",
-                json!({"agent_id":ID,"name":"Grace","request_key":"remote-rename"}),
-            )
-            .await
-            .unwrap();
-            *tap.race_entry.lock().unwrap() = Some(
-                log_client::decode_hex(remote.sends()[1]["entry"]["data"].as_str().unwrap())
-                    .unwrap(),
-            );
-            tap.races.store(1, Ordering::SeqCst);
-            let error = write(
-                &f,
-                "agent.update_tag",
-                json!({"agent_id":ID,"tag":"new","request_key":"stale"}),
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(error.code, "operator_approval_stale");
-            assert_eq!(prompt.count(), 1);
-            let target = f.store().agent_row(ID).unwrap().unwrap();
-            assert_eq!(target.name, "Grace");
-            assert_eq!(target.tag, "helper");
-            assert_eq!(tap.sends().len(), 2);
-            assert_eq!(
-                rows(&f).iter().map(|r| r.op.as_str()).collect::<Vec<_>>(),
-                ["agent.create", "agent.rename"]
-            );
-            assert_eq!(f.pending(), 0);
-        }
-
-        #[tokio::test]
-        async fn head_moved_reuses_one_confirmation_and_one_agent_identity() {
-            let tap = Tap::new(1);
-            let mut f = Fixture::new("confirmation-head-moved", connector(&tap));
-            let prompt = Prompt::new(Some(Ok(())));
-            direct(&mut f, prompt.clone(), true);
-            static COUNT: AtomicUsize = AtomicUsize::new(0);
-            fn draw() -> Result<String, HandlerError> {
-                COUNT.fetch_add(1, Ordering::SeqCst);
-                Ok(ID.into())
-            }
-            f.handler.agent_id_draw = draw;
-            let target = id(&write(&f, "agent.create", new_request("retry"))
-                .await
-                .unwrap());
-            assert_eq!(target, ID);
-            assert_eq!(COUNT.load(Ordering::SeqCst), 1);
-            assert_eq!(prompt.count(), 1);
-            assert_eq!(tap.sends().len(), 2);
-            for send in tap.sends() {
-                let entry: Value = serde_json::from_slice(
-                    &log_client::decode_hex(send["entry"]["data"].as_str().unwrap()).unwrap(),
-                )
-                .unwrap();
-                assert_eq!(entry["agent_id"], ID);
-            }
-        }
-
         /// The tests above answer the prompt through a stub confirmer. These
         /// serve the real handler, with the confirmer production builds, over
         /// the SDK's in-process stand-in daemon: the `operator.confirm` request,
@@ -3099,7 +1744,7 @@ fn bootstrap_fence(
     Ok(())
 }
 
-async fn hub_or_legacy_sql<R: Send + 'static>(
+async fn hub_or_local_sql<R: Send + 'static>(
     store: Option<&RegistryStore>,
     hub: &crate::hub_write::HubSql,
     deadline: Instant,
@@ -3336,17 +1981,9 @@ impl ProjectsHandler {
         let candidate = agent_write || shared_candidate(&request.method);
         let hub_sql = self.served_hub_sql();
         let early_deadline = received + DEADLINE;
-        let read_backend = |store: &RegistryStore| {
-            let hub = store.hub_log_base()?.is_some();
-            let frozen = !hub
-                && matches!(
-                    store.engram_freeze()?,
-                    Some(entorhinal_core::remote_apply::EngramFreeze::Applied { .. })
-                );
-            Ok((hub, frozen))
-        };
-        let (hub, frozen) = if !candidate {
-            (false, false)
+        let read_backend = |store: &RegistryStore| Ok(store.hub_log_base()?.is_some());
+        let hub = if !candidate {
+            false
         } else if self.hub_switch.is_none() && !self.hub_backend_selected() {
             let store = self.with_store(|s| Ok(s.clone()))?;
             read_backend(&store)?
@@ -3360,10 +1997,7 @@ impl ProjectsHandler {
         } else {
             Some(self.with_store(|s| Ok(s.clone()))?)
         };
-        if candidate
-            && (hub || frozen)
-            && !self.residence().is_some_and(|residence| residence.ready())
-        {
+        if hub && !self.residence().is_some_and(|residence| residence.ready()) {
             return Err(HandlerError::new(
                 "hub_not_ready",
                 "hub snapshot and residence have not caught up",
@@ -3371,7 +2005,7 @@ impl ProjectsHandler {
         }
         if request.method == super::member::SET_NAME {
             let params = request.params.clone();
-            let name = hub_or_legacy_sql(
+            let name = hub_or_local_sql(
                 store.as_ref(),
                 &hub_sql,
                 early_deadline,
@@ -3381,7 +2015,7 @@ impl ProjectsHandler {
             .await?;
             request.params = serde_json::to_value(name).expect("member name encodes");
         }
-        let state = hub_or_legacy_sql(
+        let state = hub_or_local_sql(
             store.as_ref(),
             &hub_sql,
             early_deadline,
@@ -3408,7 +2042,7 @@ impl ProjectsHandler {
                 params: request.params.clone(),
             };
             let state = state.clone();
-            hub_or_legacy_sql(
+            hub_or_local_sql(
                 store.as_ref(),
                 &hub_sql,
                 early_deadline,
@@ -3472,7 +2106,7 @@ impl ProjectsHandler {
             let method = request.method.clone();
             let params = request.params.clone();
             let clock = self.clock;
-            let precheck = hub_or_legacy_sql(
+            let precheck = hub_or_local_sql(
                 store.as_ref(),
                 &hub_sql,
                 early_deadline,
@@ -3539,7 +2173,7 @@ impl ProjectsHandler {
                 let write = write.clone();
                 let method = request.method.clone();
                 let caller = principal.clone();
-                if let Some(body) = hub_or_legacy_sql(
+                if let Some(body) = hub_or_local_sql(
                     store.as_ref(),
                     &hub_sql,
                     early_deadline,
@@ -3617,11 +2251,11 @@ impl ProjectsHandler {
         } else {
             lock.await
         };
-        let mut writer = lock_result.map_err(|_| {
+        let writer = lock_result.map_err(|_| {
             HandlerError::new("identity_log_contended", "writer lock deadline expired")
         })?;
         // Re-read after the lock: enable/join can change state while we queue.
-        let (state, hub) = hub_or_legacy_sql(
+        let (state, hub) = hub_or_local_sql(
             store.as_ref(),
             &hub_sql,
             deadline,
@@ -3644,7 +2278,7 @@ impl ProjectsHandler {
                 ));
             }
             let write = prepared.expect("shared write was decoded");
-            // Keep the hub-only future out of the local and legacy write state machine.
+            // Keep the hub-only future out of the local write state machine.
             let result =
                 Box::pin(self.hub_shared_write(&request, write, &principal, approval, deadline));
             let body = if let Some(guard) = &mut confirmation {
@@ -3668,17 +2302,6 @@ impl ProjectsHandler {
                 .get()
                 .unwrap_or_else(crate::hub_write::store_unavailable)
         })?;
-        if candidate
-            && matches!(
-                store.engram_freeze()?,
-                Some(entorhinal_core::remote_apply::EngramFreeze::Applied { .. })
-            )
-        {
-            return Err(HandlerError::new(
-                "hub_not_ready",
-                "hub snapshot has not been applied",
-            ));
-        }
         if agent_write && matches!(state.as_str(), "enabling" | "joining") {
             return Err(HandlerError::new(
                 "identity_log_enabling",
@@ -3686,8 +2309,6 @@ impl ProjectsHandler {
             ));
         }
         bootstrap_fence(&store, &state, &request)?;
-        // Draw identity and appearance once, before either a local write or the
-        // first shared attempt. A head-moved retry must retain both after-images.
         let creating = request.method == "agent.create"
             || matches!(&prepared, Some(Write::Consent(plan,_)) if matches!(plan.tool.as_str(), "agents_hire" | "agents_create_head"));
         if creating {
@@ -3714,154 +2335,49 @@ impl ProjectsHandler {
         } else {
             None
         };
-        if state != "enabled" || !candidate {
-            if agent_write {
-                let body = prepared.unwrap().run(
-                    &store,
-                    &principal,
-                    (self.clock)(),
-                    &agent_id,
-                    avatar,
-                    None,
-                )?;
-                self.commits.notify_waiters();
-                return self.record_mutation(Ok(body));
-            }
-            if approval.is_some() || creating {
-                let before = store.generation().map_err(storage_error)?;
-                let body = prepared.unwrap().run(
-                    &store,
-                    &principal,
-                    (self.clock)(),
-                    &agent_id,
-                    avatar,
-                    approval.as_ref(),
-                )?;
-                // Confirmed local commits wake the identity feed just like
-                // execute does; a cached reply must not wake idle readers.
-                let committed = store.generation().map_err(storage_error)? != before;
-                if committed {
-                    self.commits.notify_waiters();
-                }
-                if request.method == "register" && store.root_records_enabled() {
-                    if let Err(error) = store
-                        .with_principal(&principal)
-                        .bind_unbound_roots("entorhinal")
-                    {
-                        tracing::warn!(target:"binding", "binding after confirmed register failed: {error}");
-                    }
-                }
-                return self.record_mutation(if request.method.starts_with("agent.") {
-                    self.attach_incarnation(body)
-                } else {
-                    Ok(body)
-                });
-            }
-            return self.execute(request, key);
-        }
-        let write = prepared.unwrap();
-        // A preceding writer may have populated this key while we queued.
-        if let Some(body) = write.probe(&store, &request.method, &principal)? {
-            return if request.method.starts_with("agent.") {
-                self.attach_incarnation(body)
-            } else {
-                Ok(body)
-            };
-        }
-        // An earlier attempt with this key may have reached the log after its
-        // local transaction failed. Once catch-up applies that entry, its reply
-        // is kept under the key, and running the write again would conflict
-        // with the write's own earlier result. Look before the first catch-up
-        // and again after each one.
-        let reply_key = legacy_reply_key(&request, &write)?;
-        let recovered = |store: &RegistryStore| -> Result<Option<Vec<u8>>, HandlerError> {
-            let Some((key, digest)) = &reply_key else {
-                return Ok(None);
-            };
-            let Some(reply) = store.hub_local_reply(key, digest)? else {
-                return Ok(None);
-            };
-            let reply = hub_reply(reply)?;
-            if request.method.starts_with("agent.") {
-                self.attach_incarnation(reply).map(Some)
-            } else {
-                Ok(Some(reply))
-            }
-        };
-        if let Some(body) = recovered(&store)? {
-            return Ok(body);
-        }
-        let now = (self.clock)();
-        let settlement = if agent_write {
-            (received + SETTLEMENT).min(deadline)
-        } else if direct {
-            (budget_start + SETTLEMENT).min(received + OPERATOR_BOUND)
-        } else {
-            received + SETTLEMENT
-        };
-        for retry in 0..=RETRIES {
-            self.catch_up(&store, deadline).await?;
-            if let Some(body) = recovered(&store)? {
-                return Ok(body);
-            }
-            let operation = write.clone();
-            let principal = principal.clone();
-            let stable_id = agent_id.clone();
-            let stable_avatar = avatar.clone();
-            let approval = approval.clone();
-            let (returned_writer, result) = ChangeWriter {
-                log: &self.log_client,
-                health: &self.health,
-                reply_key: reply_key.clone(),
-                #[cfg(test)]
-                commit_hook: self.shared_commit_hook.clone(),
-            }
-            .append(&store, writer, settlement, move |store| {
-                operation.run(
-                    store,
-                    &principal,
-                    now,
-                    &stable_id,
-                    stable_avatar,
-                    approval.as_ref(),
-                )
-            })
-            .await?;
-            writer = returned_writer;
-            if result.as_ref().is_err_and(|e| e.code == "head_moved") {
-                if retry == RETRIES {
-                    return Err(HandlerError::new(
-                        "identity_log_contended",
-                        "log head moved after five retries",
-                    ));
-                }
-                continue;
-            }
-            let mut body = result?;
-            // Append receipts have no author. Read back a first own write so
-            // the next operator call can use its verified member identity.
-            if store.persisted_self_author()?.is_none() {
-                let _ = self.catch_up(&store, deadline).await;
-            }
-            if matches!(
-                request.method.as_str(),
-                "register" | "add_root" | "move_root_to_new_project"
-            ) && store.root_records_enabled()
-            {
-                if let Err(error) = store
-                    .with_principal(&principal_label(admission.principal.as_ref()))
-                    .bind_unbound_roots("entorhinal")
-                {
-                    tracing::warn!(target:"binding", "binding after shared write failed: {error}");
-                }
-            }
-            if request.method.starts_with("agent.") {
-                body = self.attach_incarnation(body)?;
-            }
+        if agent_write {
+            let body = prepared.unwrap().run(
+                &store,
+                &principal,
+                (self.clock)(),
+                &agent_id,
+                avatar,
+                None,
+            )?;
             self.commits.notify_waiters();
             return self.record_mutation(Ok(body));
         }
-        unreachable!()
+        if approval.is_some() || creating {
+            let before = store.generation().map_err(storage_error)?;
+            let body = prepared.unwrap().run(
+                &store,
+                &principal,
+                (self.clock)(),
+                &agent_id,
+                avatar,
+                approval.as_ref(),
+            )?;
+            // Confirmed local commits wake the identity feed just like
+            // execute does; a cached reply must not wake idle readers.
+            let committed = store.generation().map_err(storage_error)? != before;
+            if committed {
+                self.commits.notify_waiters();
+            }
+            if request.method == "register" && store.root_records_enabled() {
+                if let Err(error) = store
+                    .with_principal(&principal)
+                    .bind_unbound_roots("entorhinal")
+                {
+                    tracing::warn!(target:"binding", "binding after confirmed register failed: {error}");
+                }
+            }
+            return self.record_mutation(if request.method.starts_with("agent.") {
+                self.attach_incarnation(body)
+            } else {
+                Ok(body)
+            });
+        }
+        self.execute(request, key)
     }
 
     async fn hub_shared_write(
@@ -3984,31 +2500,6 @@ impl ProjectsHandler {
             .await?,
         )
     }
-}
-
-/// The request key and argument digest under which a legacy shared write's
-/// reply is kept when the log accepts its entry after the local transaction
-/// failed. Only writes whose local path caches replies by request key take
-/// part: consent-card writes record their outcome on the consent request, and
-/// the root, member-name and avatar-manifest writes carry no request key.
-fn legacy_reply_key(
-    request: &WireRequest,
-    write: &Write,
-) -> Result<Option<(String, String)>, HandlerError> {
-    if matches!(
-        write,
-        Write::Consent(..)
-            | Write::CatalogInstall(..)
-            | Write::ManifestAvatar(..)
-            | Write::Add(_)
-            | Write::RefreshKey(_)
-            | Write::MoveRoot(_)
-            | Write::Member(_)
-    ) {
-        return Ok(None);
-    }
-    let (key, digest) = hub_request(request, write)?;
-    Ok(key.filter(|key| !key.is_empty()).map(|key| (key, digest)))
 }
 
 fn hub_request(
@@ -4159,172 +2650,5 @@ fn preview_hub_create(
             "hub_not_ready",
             "agent create did not produce a shared after-image",
         )),
-    }
-}
-
-pub(super) struct ChangeWriter<'a> {
-    pub(super) log: &'a log_client::LogClient,
-    pub(super) health: &'a Arc<HealthGauges>,
-    /// The request key and argument digest the write's reply is cached under,
-    /// kept with the pending attempt so a write the log accepted after its
-    /// local transaction failed still answers its retry with that reply.
-    pub(super) reply_key: Option<(String, String)>,
-    #[cfg(test)]
-    pub(super) commit_hook: Option<Arc<dyn Fn() + Send + Sync>>,
-}
-
-impl ChangeWriter<'_> {
-    pub(super) async fn append(
-        &self,
-        store: &RegistryStore,
-        writer: tokio::sync::OwnedMutexGuard<()>,
-        settlement: Instant,
-        operation: impl FnOnce(&RegistryStore) -> Result<Vec<u8>, HandlerError> + Send + 'static,
-    ) -> Result<
-        (
-            tokio::sync::OwnedMutexGuard<()>,
-            Result<Vec<u8>, HandlerError>,
-        ),
-        HandlerError,
-    > {
-        let status = store.identity_log_status().map_err(storage_error)?;
-        let head = status.last_applied_position;
-        let pending_count = status.pending_write_count;
-        let mut id = [0; 16];
-        getrandom::getrandom(&mut id)
-            .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
-        let (bytes_tx, bytes_rx) = tokio::sync::oneshot::channel();
-        let (decision_tx, decision_rx) = std::sync::mpsc::channel();
-        let worker_store = store.clone();
-        let health = Arc::clone(self.health);
-        let reply_key = self.reply_key.clone();
-        #[cfg(test)]
-        let commit_hook = self.commit_hook.clone();
-        let worker = tokio::task::spawn_blocking(move || {
-            // Dropping the request must not release exclusion before this
-            // worker has committed or rolled back its SQLite transaction.
-            let mut bytes_tx = Some(bytes_tx);
-            let result = worker_store.shared_attempt_with_reply(
-                log_client::encode_hex(&id),
-                head,
-                reply_key,
-                move |bytes| {
-                    // Preparation reaches this callback only after the pending
-                    // row committed. Publish before the append can park.
-                    health
-                        .log_pending
-                        .store(pending_count + 1, Ordering::Relaxed);
-                    let _ = bytes_tx.take().unwrap().send(bytes);
-                    let decision =
-                        decision_rx
-                            .recv()
-                            .unwrap_or_else(|_| SharedSettlement::Rollback {
-                                sent: true,
-                                code: "engram_outcome_unknown".into(),
-                                message: "settlement waiter was cancelled".into(),
-                            });
-                    #[cfg(test)]
-                    if matches!(decision, SharedSettlement::Commit(_)) {
-                        if let Some(hook) = &commit_hook {
-                            hook();
-                        }
-                    }
-                    decision
-                },
-                || operation(&worker_store),
-            );
-            (writer, result)
-        });
-        let mut committed_position = None;
-        let mut proven_unsent = false;
-        if let Ok(bytes) = bytes_rx.await {
-            let append = AppendRequest {
-                expected_head: head as u64,
-                entry_id: id,
-                kind: EntryKind::Change,
-                data: bytes,
-            };
-            let decision = self.settle(&append, settlement).await;
-            match &decision {
-                SharedSettlement::Commit(position) => committed_position = Some(*position),
-                SharedSettlement::Rollback { sent, .. } => proven_unsent = !sent,
-            }
-            let _ = decision_tx.send(decision);
-        }
-        let (returned_writer, result) = worker
-            .await
-            .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
-        if result.is_ok() || proven_unsent {
-            super::enable::refresh(self.health, store);
-            if let Some(position) = committed_position.filter(|_| result.is_ok()) {
-                self.health.log_applied.store(position, Ordering::Relaxed);
-                self.health.log_head.fetch_max(position, Ordering::Relaxed);
-            }
-        }
-        if let Err(error) = &result {
-            super::enable::record_error(self.health, error);
-        }
-        Ok((returned_writer, result))
-    }
-
-    async fn settle(&self, request: &AppendRequest, bound: Instant) -> SharedSettlement {
-        let mut sent = false;
-        loop {
-            if Instant::now() >= bound {
-                return SharedSettlement::Rollback {
-                    sent,
-                    code: if sent {
-                        "engram_outcome_unknown"
-                    } else {
-                        "engram_unavailable"
-                    }
-                    .into(),
-                    message: "shared write settlement deadline expired".into(),
-                };
-            }
-            sent = true;
-            match timeout_at(
-                bound.min(Instant::now() + SEND_WAIT),
-                self.log.append(request),
-            )
-            .await
-            {
-                Ok(Ok(reply)) if reply.position == request.expected_head + 1 => {
-                    return SharedSettlement::Commit(reply.position as i64)
-                }
-                Ok(Err(LogError::HeadMoved { .. })) => {
-                    return SharedSettlement::Rollback {
-                        sent,
-                        code: "head_moved".into(),
-                        message: "log head moved".into(),
-                    }
-                }
-                Ok(Err(LogError::Refused { code, .. })) if code == "hub_switch_pending" => {
-                    return SharedSettlement::Rollback {
-                        sent: false,
-                        code,
-                        message: crate::hub_switch::pending().message,
-                    };
-                }
-                Ok(Err(LogError::IdReused)) | Ok(Ok(_)) => {
-                    self.health.log_state.store(3, Ordering::Relaxed);
-                    tracing::warn!(entry_id = %log_client::encode_hex(&request.entry_id), "identity log invariant: entry id reused or invalid receipt position");
-                    return SharedSettlement::Rollback {
-                        sent,
-                        code: "identity_log_invariant".into(),
-                        message: format!(
-                            "identity log invariant for entry_id {}",
-                            log_client::encode_hex(&request.entry_id)
-                        ),
-                    };
-                }
-                Ok(Err(LogError::KeyUnavailable)) => {
-                    self.health.log_state.store(1, Ordering::Relaxed)
-                }
-                Ok(Err(LogError::NotMember)) => self.health.log_state.store(2, Ordering::Relaxed),
-                _ => {}
-            }
-            tokio::time::sleep_until(bound.min(Instant::now() + RESEND_DELAY)).await;
-        }
     }
 }

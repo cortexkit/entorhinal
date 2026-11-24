@@ -66,7 +66,6 @@ pub(crate) struct FakeRecord {
     pub calls: AtomicUsize,
     pub batches: Mutex<Vec<Vec<String>>>,
     pub cas_attempts: Mutex<Vec<Value>>,
-    changed: tokio::sync::Notify,
     principal: Mutex<String>,
     errors: Mutex<HashMap<String, String>>,
 }
@@ -86,7 +85,6 @@ impl FakeRecord {
             calls: AtomicUsize::new(0),
             batches: Mutex::new(Vec::new()),
             cas_attempts: Mutex::new(Vec::new()),
-            changed: tokio::sync::Notify::new(),
             principal: Mutex::new("reserved:entorhinal".into()),
             errors: Mutex::new(HashMap::new()),
         })
@@ -112,18 +110,6 @@ impl FakeRecord {
             .offline
             .store(self.offline.load(Ordering::Relaxed), Ordering::Relaxed);
         next
-    }
-
-    pub(crate) async fn wait_for_calls(&self, count: usize) {
-        loop {
-            let changed = self.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if self.calls.load(Ordering::Relaxed) >= count {
-                return;
-            }
-            changed.await;
-        }
     }
 
     pub(crate) fn error(&self, subject: &str, code: Option<&str>) {
@@ -351,7 +337,6 @@ impl LogConnector for FakeRecordConnector {
 impl LogTransport for FakeRecord {
     async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        self.changed.notify_waiters();
         if self.hung.load(Ordering::Relaxed) {
             std::future::pending::<()>().await;
         }

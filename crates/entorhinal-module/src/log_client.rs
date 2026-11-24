@@ -890,76 +890,16 @@ mod tests {
     }
 
     async fn assert_authorship_protocol_stalls(entry: Value, diagnostic: &str) {
-        use crate::ProjectsHandler;
-        use entorhinal_core::RegistryStore;
-        use std::sync::atomic::Ordering;
-        use tokio::time::{Duration, Instant};
-
         let stub = Stub::new(json!({"result":{"head":1,"entries":[entry]}}));
         let error = client(&stub).read(0, 128).await.unwrap_err();
         assert!(
             matches!(&error, LogError::Protocol(message) if message.contains(diagnostic)),
             "{error:?}"
         );
-
-        let (dir, descriptor) = crate::tests::scratch_descriptor(&format!(
-            "authorship-protocol-{}",
-            crate::incarnation::new_incarnation().unwrap()
-        ));
-        let store = RegistryStore::open(&descriptor).unwrap();
-        store
-            .apply_entry("identity_log.enable", "{}", "test", None, |tx| {
-                tx.execute("UPDATE identity_log_state SET state='enabled'", [])?;
-                Ok(())
-            })
-            .unwrap();
-        let before = store.identity_log_status().unwrap();
-        let generation = store.generation().unwrap();
-        let handler = ProjectsHandler::with_log_connector(
-            "authorship-test".into(),
-            || 700,
-            Arc::new(StubConnector(stub.clone())),
-        );
-        let error = handler
-            .catch_up(&store, Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "identity_log_stalled");
-        assert!(error.message.contains(diagnostic), "{}", error.message);
-        assert!(error.message.contains("at log position 1"));
-        assert_eq!(handler.health.log_state.load(Ordering::Relaxed), 6);
-        assert_eq!(store.identity_log_status().unwrap(), before);
-        assert_eq!(store.generation().unwrap(), generation);
-        assert!(store.enumerate(None).unwrap().projects.is_empty());
-        drop(handler);
-
-        // With the same valid body and repaired metadata, a fresh reader can
-        // advance. The protocol error did not poison the durable progress.
-        *stub.reply.lock().unwrap() = Ok(serde_json::to_vec(
-            &json!({"result":{"head":1,"entries":[catch_up_row()]}}),
-        )
-        .unwrap());
-        let handler = ProjectsHandler::with_log_connector(
-            "authorship-test".into(),
-            || 700,
-            Arc::new(StubConnector(stub)),
-        );
-        handler
-            .catch_up(&store, Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert_eq!(
-            store.identity_log_status().unwrap().last_applied_position,
-            1
-        );
-        assert_eq!(handler.health.log_state.load(Ordering::Relaxed), 0);
-        drop(handler);
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
-    async fn read_requires_signed_by_self_and_catch_up_stalls() {
+    async fn read_requires_signed_by_self() {
         let mut missing = catch_up_row();
         missing.as_object_mut().unwrap().remove("signed_by_self");
         assert_authorship_protocol_stalls(missing, "signed_by_self").await;
@@ -971,7 +911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_requires_author_and_catch_up_stalls() {
+    async fn read_requires_author() {
         let mut missing = catch_up_row();
         missing.as_object_mut().unwrap().remove("author");
         assert_authorship_protocol_stalls(missing, "author").await;
@@ -983,7 +923,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_rejects_noncanonical_author_and_catch_up_stalls() {
+    async fn read_rejects_noncanonical_author() {
         for author in [
             "".to_string(),
             "a".repeat(31),

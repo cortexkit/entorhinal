@@ -10,8 +10,9 @@ mod trust;
 
 use crate::{
     catalog_blob::BlobStore,
-    catalog_consumer, catch_up,
+    catalog_consumer,
     door_client::{CutItem, CutRequest as DoorCut, DoorClient},
+    hub_identity_log::SharedLog,
     HandlerError, ProjectsHandler,
 };
 use cortexkit_role_agent_data::{
@@ -64,7 +65,7 @@ struct Checkpoint {
 }
 pub(crate) struct CatalogMove {
     store: Weak<Mutex<Option<RegistryStore>>>,
-    catch_up: catch_up::Worker,
+    hub_log: Arc<Mutex<Option<Arc<dyn SharedLog>>>>,
     door: DoorClient,
     consumers: Arc<dyn catalog_consumer::ConsumerDiscovery>,
     lock: Arc<tokio::sync::Mutex<()>>,
@@ -77,7 +78,7 @@ impl ProjectsHandler {
     pub(crate) fn catalog_move_context(&self) -> CatalogMove {
         CatalogMove {
             store: Arc::downgrade(&self.store),
-            catch_up: self.catch_up_worker(),
+            hub_log: self.hub_shared_log.clone(),
             door: self.door_client.clone(),
             consumers: self.catalog_agent.consumers.clone(),
             lock: self.catalog_move_lock.clone(),
@@ -164,14 +165,20 @@ impl CatalogMove {
     ) -> Result<Vec<CatalogPin>, HandlerError> {
         let store = self.store()?;
         let local_agent = agent.to_owned();
-        let local = crate::catalog_sql::run(move || {
-            store
-                .catalog_pin_digest(&local_agent)
-                .map_err(HandlerError::from)
+        let (local, installed) = crate::catalog_sql::run(move || -> Result<_, HandlerError> {
+            Ok((
+                store.catalog_pin_digest(&local_agent)?,
+                store.hub_log_base()?.is_some(),
+            ))
         })
         .await?;
-        if local != expected {
-            self.catch_up.for_move().await?;
+        if local != expected && installed {
+            let hub_log = self.hub_log.lock().unwrap().clone().ok_or_else(|| {
+                HandlerError::new("hub_not_ready", "hub identity log is not installed")
+            })?;
+            hub_log
+                .catch_up(Instant::now() + crate::catch_up::READ_DEADLINE)
+                .await?;
         }
         self.local_preflight(agent, expected).await.map(|p| p.pins)
     }

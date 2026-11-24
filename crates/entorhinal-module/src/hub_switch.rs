@@ -37,7 +37,7 @@ const HUB_PROTOCOL: u64 = 1;
 const CUTS: &str = "engram-hub-cuts/v1";
 const PENDING: &str = "hub_switch_pending";
 
-pub(crate) fn pending() -> HandlerError {
+fn pending() -> HandlerError {
     HandlerError::new(PENDING, "the identity log is switching to the hub")
 }
 
@@ -306,12 +306,20 @@ pub(super) struct Switch {
 }
 
 #[async_trait::async_trait]
-trait Probe: Send + Sync {
+pub(super) trait Probe: Send + Sync {
     fn activate(&self);
     async fn head(&self, deadline: Instant) -> Result<u64, HandlerError>;
     async fn local_box(&self, deadline: Instant) -> Result<String, HandlerError>;
     async fn hub_cuts(&self, deadline: Instant) -> Result<bool, HandlerError>;
     fn transport(&self) -> Option<(&Arc<Hub>, &Arc<Callosum>)> {
+        None
+    }
+    #[cfg(test)]
+    async fn transfer_snapshot(
+        &self,
+        _image: Option<&MigrationImage>,
+        _deadline: Instant,
+    ) -> Option<Result<bool, HandlerError>> {
         None
     }
 }
@@ -388,6 +396,15 @@ impl Runtime {
 }
 
 impl Switch {
+    #[cfg(test)]
+    pub(super) fn with_probe(probe: Arc<dyn Probe>) -> Self {
+        Self {
+            probe,
+            moves: Arc::default(),
+            drain: Default::default(),
+        }
+    }
+
     pub(super) fn new(
         hub: Arc<Hub>,
         moves: Arc<Mutex<()>>,
@@ -530,10 +547,8 @@ impl Switch {
                 })
                 .await?;
         }
-        let base = image.map_or(0, |image| image.engram_through);
-        let log = self.identity_log(runtime, base, deadline).await?;
         // Keep multipart verification and epoch recovery off the caller's stack.
-        if !Box::pin(snapshot::transfer(&log, image, deadline)).await? {
+        if !Box::pin(self.transfer_snapshot(runtime, image, deadline)).await? {
             return Err(waiting());
         }
         // Activation is retried independently after the base has committed.
@@ -551,6 +566,21 @@ impl Switch {
             .await?;
         runtime.commits.notify_waiters();
         Ok(())
+    }
+
+    async fn transfer_snapshot(
+        &self,
+        runtime: &Runtime,
+        image: Option<&MigrationImage>,
+        deadline: Instant,
+    ) -> Result<bool, HandlerError> {
+        #[cfg(test)]
+        if let Some(result) = self.probe.transfer_snapshot(image, deadline).await {
+            return result;
+        }
+        let base = image.map_or(0, |image| image.engram_through);
+        let log = self.identity_log(runtime, base, deadline).await?;
+        snapshot::transfer(&log, image, deadline).await
     }
 
     pub(super) async fn prepare_enable(
@@ -595,6 +625,8 @@ impl Switch {
         .await
     }
 
+    // The legacy hub switch coordinator and its tests are removed together.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) async fn advance(
         &self,
         sql: &crate::hub_write::HubSql,

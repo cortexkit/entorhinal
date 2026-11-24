@@ -1807,8 +1807,8 @@ impl ProjectsHandler {
                 ))
             }
             "identity_log.enable" => Err(HandlerError::new(
-                "engram_unavailable",
-                "identity log enabling isn't available in this build yet",
+                "served_path_required",
+                "identity log enabling requires the asynchronous served path",
             )),
             store_origin::ADOPT => Err(HandlerError::new(
                 "served_path_required",
@@ -4085,10 +4085,17 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn attach_surface_enable_is_direct_only_and_fails_closed() {
+    #[tokio::test]
+    async fn attach_surface_enable_is_direct_only_and_fails_closed() {
         let (dir, descriptor) = scratch_descriptor("enable-admission");
-        let handler = ProjectsHandler::new().unwrap();
+        let fail = Arc::new(crate::fake_log::FailConnector::default());
+        let mut handler =
+            ProjectsHandler::with_log_connector("enable-test".into(), || 700, fail.clone());
+        let prompts = Arc::new(crate::served_vectors::Approve {
+            summaries: Mutex::default(),
+        });
+        handler.operator_confirmer = prompts.clone();
+        assert!(handler.hub_switch.is_none());
         *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
         let before = handler
             .with_store(RegistryStore::identity_log_status)
@@ -4108,22 +4115,31 @@ mod tests {
             handler
                 .route_admissions()
                 .insert(key, RouteAdmission::from_bind(principal.clone(), None));
-            let error = handler
-                .execute(
-                    WireRequest {
-                        method: "identity_log.enable".into(),
-                        params: json!({}),
-                    },
-                    key,
-                )
-                .unwrap_err();
-            if principal == Some(Principal::Direct) {
-                assert_eq!(error.code, "engram_unavailable");
-                assert!(error.message.contains("isn't available in this build yet"));
-            } else {
-                assert_eq!(error.code, "write_not_permitted");
+            for params in [
+                json!({}),
+                json!({"extra":true}),
+                json!({"without_agents":"yes"}),
+                json!(true),
+            ] {
+                let expected = if principal != Some(Principal::Direct) {
+                    "write_not_permitted"
+                } else if params == json!({}) {
+                    "hub_not_ready"
+                } else {
+                    "invalid_request"
+                };
+                let body =
+                    serde_json::to_vec(&json!({"method":"identity_log.enable","params":params}))
+                        .unwrap();
+                let outcome = handler.handle_served_request(&body, key).await;
+                assert!(
+                    matches!(outcome, HandlerOutcome::Error { ref code, .. } if code == expected),
+                    "{expected}: {outcome:?}"
+                );
             }
         }
+        assert!(prompts.summaries.lock().unwrap().is_empty());
+        assert_eq!(fail.calls(), 0);
         assert_eq!(
             handler
                 .with_store(RegistryStore::identity_log_status)

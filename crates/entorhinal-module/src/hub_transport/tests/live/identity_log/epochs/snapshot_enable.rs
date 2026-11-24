@@ -5,6 +5,7 @@ use crate::{
 };
 use entorhinal_core::enable_state::HubSnapshot;
 
+mod served_enable;
 mod switch_baseline;
 
 const ROUTE: RouteKey = (125, 1);
@@ -434,6 +435,42 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
         follower.sql.test_store().catalog_pins(&agent(1)).unwrap(),
         pins.pins
     );
+    // Stop the follower at the previous pin digest while the source clears it.
+    // Preflight must wait for the restarted hub cursor and re-read pins.
+    let tail = b.hub_tail_task.lock().unwrap().take().unwrap();
+    tail.abort();
+    assert!(tail.await.unwrap_err().is_cancelled());
+    let empty = entorhinal_core::catalog_agent::pin_digest(&[]).unwrap();
+    a.catalog_pins_write_wait(
+        entorhinal_core::catalog_agent::PinWriteRequest {
+            request_key: Some("hub-clear-pins".into()),
+            pins: vec![],
+            ..pins
+        },
+        CORE,
+        Instant::now(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        follower
+            .sql
+            .test_store()
+            .catalog_pin_digest(&agent(1))
+            .unwrap(),
+        empty
+    );
+    let (entered, started) = oneshot::channel();
+    let (release, held) = oneshot::channel();
+    *rig.b.leaf.head_gate.lock().unwrap() = Some((entered, held));
+    let preflight = tokio::spawn({
+        let catalog = b.catalog_move_context();
+        async move { catalog.preflight(&agent(1), &empty).await }
+    });
+    within(started).await.unwrap();
+    *b.hub_tail_task.lock().unwrap() = Some(follower.start_installed_tail_for_test().unwrap());
+    release.send(()).unwrap();
+    assert!(within(preflight).await.unwrap().unwrap().is_empty());
     assert_eq!(
         result(b.handle_request(&body("user.get", json!({})), CORE))["user"]["name"],
         "Mira"

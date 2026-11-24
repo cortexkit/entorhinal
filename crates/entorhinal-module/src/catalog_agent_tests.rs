@@ -1707,23 +1707,20 @@ async fn catalog_atomic_pin_failure_rolls_back_generation_grant_and_receipt() {
 }
 
 #[tokio::test]
-async fn catalog_shared_install_rolls_back_log_refusal() {
-    let mut f = Fixture::new().await;
-    let log = crate::fake_log::FakeLog::default();
-    f.tools.handler.log_client = log.client();
+async fn catalog_shared_install_does_not_commit_before_hub_is_ready() {
+    let f = Fixture::new().await;
     f.store()
         .apply_entry("identity_log.enable", "{}", "test", None, |tx| {
-            tx.execute("UPDATE identity_log_state SET state='enabled'", [])?;
+            tx.execute(
+                "UPDATE identity_log_state SET state='enabled',hub_log_base=0,hub_ready=1",
+                [],
+            )?;
             Ok(())
         })
         .unwrap();
     f.grant();
     let plan = f.prepare("shared").await;
-    log.on_append(crate::fake_log::Action::Refuse {
-        code: "id_reused".into(),
-        detail: None,
-    });
-    assert_eq!(error_code(f.install(&plan).await), "identity_log_invariant");
+    assert_eq!(error_code(f.install(&plan).await), "hub_not_ready");
     assert!(f
         .store()
         .catalog_pins(&f.tools.agents[0])
@@ -1734,28 +1731,6 @@ async fn catalog_shared_install_rolls_back_log_refusal() {
         .catalog_agent_generations(&f.tools.agents[0])
         .unwrap()
         .is_empty());
-    assert_eq!(log.head(), 0);
-}
-
-#[tokio::test]
-async fn catalog_shared_install_appends_identity_log_once() {
-    let mut f = Fixture::new().await;
-    let log = crate::fake_log::FakeLog::default();
-    f.tools.handler.log_client = log.client();
-    f.store()
-        .apply_entry("identity_log.enable", "{}", "test", None, |tx| {
-            tx.execute("UPDATE identity_log_state SET state='enabled'", [])?;
-            Ok(())
-        })
-        .unwrap();
-    f.grant();
-    let plan = f.prepare("shared-success").await;
-    let installed = tool_result(f.install(&plan).await);
-    assert_eq!(log.head(), 1);
-    assert_eq!(tool_result(f.install(&plan).await), installed);
-    assert_eq!(log.head(), 1);
-    assert_eq!(f.store().catalog_pins(&f.tools.agents[0]).unwrap().len(), 1);
-    assert!(f.store().verify().unwrap().ok);
 }
 
 #[tokio::test]

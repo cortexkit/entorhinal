@@ -342,18 +342,15 @@ async fn bus_changes_placement_drains_backlog_while_kv_fails() {
 
 #[tokio::test]
 async fn bus_changes_placement_remote_apply_wakes_publisher() {
-    let mut f = Fixture::new("bus-placement-remote").await;
-    let log = crate::fake_log::FakeLog::default();
-    let store = f.handler.store.lock().unwrap().take().unwrap();
-    f.handler =
-        ProjectsHandler::with_log_connector(INCARNATION.into(), || 700, Arc::new(log.clone()));
-    *f.handler.store.lock().unwrap() = Some(store);
-    f.handler
-        .with_store(|s| {
-            s.apply_entry("identity_log.enable", "{}", "test", None, |tx| {
-                tx.execute("UPDATE identity_log_state SET state='enabled'", [])?;
-                Ok(())
-            })
+    let f = Fixture::new("bus-placement-remote").await;
+    let store = f.handler.with_store(|s| Ok(s.clone())).unwrap();
+    store
+        .apply_entry("identity_log.enable", "{}", "test", None, |tx| {
+            tx.execute(
+                "UPDATE identity_log_state SET state='enabled', hub_log_base=0",
+                [],
+            )?;
+            Ok(())
         })
         .unwrap();
     let mut published = Published::start(&f.handler, Arc::default());
@@ -369,15 +366,17 @@ async fn bus_changes_placement_remote_apply_wakes_publisher() {
     };
     let mut row = serde_json::to_value(&fact).unwrap();
     row["pos"] = json!(1);
-    log.client().append(&crate::log_client::AppendRequest {
-        expected_head: 0, entry_id: [0x55;16], kind: crate::log_client::EntryKind::Change,
-        data: serde_json::to_vec(&json!({"op":"project.shared","tables":{"placement_fact":{"upsert":[row],"delete":[]}}})).unwrap(),
-    }).await.unwrap();
-    let store = f.handler.with_store(|s| Ok(s.clone())).unwrap();
-    f.handler
-        .catch_up(&store, tokio::time::Instant::now() + Duration::from_secs(5))
-        .await
-        .unwrap();
+    store.apply_hub_remote_entry(&entorhinal_core::remote_apply::RemoteEntry {
+        position: 1,
+        entry_id: "55".repeat(16),
+        author: "ab".repeat(16),
+        signer: "ab".repeat(16),
+        key_id: "key".into(),
+        envelope_version: 1,
+        kind: "change".into(),
+        entry: serde_json::to_vec(&json!({"op":"project.shared","tables":{"placement_fact":{"upsert":[row],"delete":[]}}})).unwrap(),
+    }, 1).unwrap();
+    f.handler.commits.notify_waiters();
     drop(store);
     let (id, body) = published.event().await;
     assert_eq!(id, fact.fact_id);

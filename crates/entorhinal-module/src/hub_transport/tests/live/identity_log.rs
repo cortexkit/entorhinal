@@ -71,6 +71,7 @@ struct Leaf {
     client: async_nats::Client,
     health: Arc<HealthGauges>,
     gate: StdMutex<Option<Gate>>,
+    refuse_log_kind_after: StdMutex<Option<(&'static str, usize)>>,
     sends: StdMutex<Vec<(u64, String, Vec<u8>)>>,
     reads: StdMutex<Vec<u64>>,
     requests: StdMutex<Vec<String>>,
@@ -250,6 +251,17 @@ impl Transport for Leaf {
         let record = UnverifiedRecord::parse(LOG_SUBJECT, &write.value).unwrap();
         assert_eq!(record.header().writer, self.box_id.to_string());
         assert_eq!(record.header().entry_id, id);
+        if let Some((kind, remaining)) = self.refuse_log_kind_after.lock().unwrap().as_mut() {
+            if record.header().kind == *kind {
+                if *remaining == 0 {
+                    return Err(HandlerError::new(
+                        "hub_write_refused",
+                        "fixture refused the next entry",
+                    ));
+                }
+                *remaining -= 1;
+            }
+        }
         self.sends
             .lock()
             .unwrap()
@@ -317,6 +329,7 @@ async fn leaf(
         client,
         health,
         gate: StdMutex::default(),
+        refuse_log_kind_after: StdMutex::default(),
         sends: StdMutex::default(),
         reads: StdMutex::default(),
         head_gate: StdMutex::default(),

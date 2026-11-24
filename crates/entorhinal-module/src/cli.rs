@@ -1781,6 +1781,16 @@ fn placement_call_options(method: &str) -> subc_client_rs::CallOptions {
 /// "no projects registered" against a registry holding a project, which is a
 /// confident wrong answer rather than a visible error. A contract violation
 /// should look like one.
+#[cfg(test)]
+pub(super) fn project_log_test_wire(args: &[&str]) -> Vec<u8> {
+    let argv = args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    let Invocation::Command(command) = parse(Face::Projects, &argv) else {
+        panic!("log command did not parse: {args:?}");
+    };
+    let (method, params) = build(&command).unwrap();
+    serde_json::to_vec(&json!({"method":method,"params":params})).unwrap()
+}
+
 fn unwrap_result(envelope: Value) -> Result<Value, (u8, String)> {
     match envelope {
         Value::Object(mut map) => map.remove("result").ok_or_else(|| {
@@ -2961,83 +2971,6 @@ mod tests {
                 _ => panic!("unexpected CLI result for {args:?}"),
             }
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn log_enable_cli_request_enables_through_operator_route() {
-        use crate::{fake_log::FakeLog, tests::scratch_descriptor};
-        let (dir, descriptor) = scratch_descriptor("enable-cli");
-        let log = std::sync::Arc::new(FakeLog::default());
-        let handler =
-            crate::ProjectsHandler::with_log_connector("cli-enable".into(), || 700, log.clone());
-        *handler.store.lock().unwrap() =
-            Some(entorhinal_core::RegistryStore::open(&descriptor).unwrap());
-        let Invocation::Command(command) =
-            parse_as(Face::Projects, &["log", "enable", "--without-agents"])
-        else {
-            panic!("log enable must parse")
-        };
-        let (method, params) = build(&command).unwrap();
-        let body = serde_json::to_vec(&json!({"method":method,"params":params})).unwrap();
-        handler.route_admissions().insert(
-            (141, 1),
-            crate::RouteAdmission {
-                principal: Some(crate::Principal::Direct),
-                flow_id: None,
-                handle: None,
-                scope: None,
-                call_mode: None,
-                providers: Default::default(),
-            },
-        );
-        let crate::HandlerOutcome::Response(bytes) =
-            handler.handle_served_request(&body, (141, 1)).await
-        else {
-            panic!("CLI enable was refused")
-        };
-        assert_eq!(
-            serde_json::from_slice::<Value>(&bytes).unwrap()["result"]["state"],
-            "enabled"
-        );
-        assert_eq!(log.head(), 1);
-        let Invocation::Command(command) = parse_as(Face::Projects, &["log", "name", "Studio"])
-        else {
-            panic!("log name must parse")
-        };
-        let (method, params) = build(&command).unwrap();
-        assert_eq!(method, "member.set_name");
-        assert_eq!(params, json!({"display_name":"Studio"}));
-        let body = serde_json::to_vec(&json!({"method":method,"params":params})).unwrap();
-        let result = {
-            let response = handler.handle_served_request(&body, (141, 1));
-            tokio::pin!(response);
-            loop {
-                tokio::select! { result = &mut response => break result, () = tokio::task::yield_now() => {} }
-            }
-        };
-        let crate::HandlerOutcome::Response(bytes) = result else {
-            panic!("log name was refused: {result:?}")
-        };
-        // The CLI unwraps every reply's `result`; a reply without it printed a
-        // transport error even though the name was saved.
-        assert_eq!(
-            unwrap_result(serde_json::from_slice(&bytes).unwrap()).unwrap(),
-            json!({"display_name":"Studio"})
-        );
-        assert_eq!(log.head(), 2);
-        let cortexkit_store_types::StorageBackend::Sqlite { path } = &descriptor.backend else {
-            unreachable!()
-        };
-        assert_eq!(
-            rusqlite::Connection::open(path)
-                .unwrap()
-                .query_row("SELECT display_name FROM member_name", [], |r| r
-                    .get::<_, String>(0))
-                .unwrap(),
-            "Studio"
-        );
-        drop(handler);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
