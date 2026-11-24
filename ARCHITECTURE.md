@@ -1,13 +1,13 @@
 # Architecture
 
-entorhinal is CortexKit's registry of projects and agents. Other modules ask it "which project is this directory?", "who is this agent, and which machine holds it?" and "which session belongs to which agent?". It runs as one process per machine, `ck-entorhinal`, supervised by the subc daemon, with one SQLite store. Several machines that belong to one operator keep the shared part of that store in step through a signed, sealed log on the operator's NATS hub after cutover, or through engram until then.
+entorhinal is CortexKit's registry of projects and agents. Other modules ask it "which project is this directory?", "who is this agent, and which machine holds it?" and "which session belongs to which agent?". It runs as one process per machine, `ck-entorhinal`, supervised by the subc daemon, with one SQLite store. Several machines that belong to one operator keep the shared part of that store in step through a signed, sealed log on the operator's NATS hub.
 
 It owns:
 
 - **Projects and checkouts:** durable project ids (`pj-…`), the folders (roots) each project has on this machine, which physical checkout a root is, and whether the operator approved it.
 - **Workspaces:** named groups of projects. Agent names are unique within a workspace.
 - **Agent identity:** names, roles, tags, labels, avatars and placement. Agent identity moved here from prefrontal-core in a one-time import; core keeps a read replica fed from entorhinal.
-- **Residence:** which machine holds each agent or role, watched from the hub's `KV_residence` bucket after cutover. Agent claims are durable; roles are renewable leases. An idle agent moves only with its data.
+- **Residence:** which machine holds each agent or role, watched from the hub's `KV_residence` bucket. Agent claims are durable; roles are renewable leases. An idle agent moves only with its data.
 - **Sessions:** which agent each host session belongs to, which runner hosts it, when it ended, and its live state from prefrontal's session-liveness bus bucket.
 - **Agent tools and consent:** the tools agents call to create workspaces, projects, heads and hires, with consent cards, standing grants and an audit.
 - **Packages:** the CortexKit package catalog on this machine (registries, verified package files, each agent's pinned packages) and publishing.
@@ -20,7 +20,7 @@ All traffic goes through daemon routes; entorhinal opens no network ports. The o
 - **prefrontal (the executive)** registers repositories, relays agent identity changes, reads `agent.changes` into its replica, registers and ends sessions as the `agent-orchestrator/v1` provider, and writes the session-liveness bus bucket entorhinal watches.
 - **Any module** reads project and agent identity. Magic Context keys memories on project ids and reads `context.*`; Plexus reads role claims; the apps read fleet identity and locations through Callosum.
 - **The NATS hub** hosts `HUB_IDLOG` and `KV_residence`. Envelopes are signed using the vault and sealed under the fleet epoch key. Readers verify records before applying them locally.
-- **engram** hosts the legacy log and claim records before the switch (`agent-sync`: `identity_log.*`, `record.*`). Its session door still carries move data (`session-door`: `cut.*`), separate from move coordination on the hub.
+- **engram** carries move data through its session door (`session-door`: `cut.*`), separate from move coordination on the hub.
 - **Cingulate** shows consent cards on the operator's phone and reads and revokes standing grants through `permissions/v1`.
 - **The daemon** shows operator presence prompts (`operator.confirm`), and its `supervisor.list` and `catalog.list` tell entorhinal which modules take part in moves and consume packages.
 - **agent-data participants** (any module declaring `agent-data/v1`) hold per-agent data and take part in moves. entorhinal is one of them, for package files and session bindings.
@@ -33,8 +33,8 @@ All traffic goes through daemon routes; entorhinal opens no network ports. The o
 - **Root:** one folder of a project on this machine. **Root key:** the machine-neutral name of a root, normally its owned `origin` remote (`owner/repo`); other machines match their checkout to the project through it. **Binding:** which physical checkout a root is, recorded by a random token in `.git/cortexkit-root-incarnation`. **Approval:** the operator's trust in one binding, keyed by its registration epoch, so a replaced checkout at the same path is not approved.
 - **Workspace head, head, hiree:** a workspace head leads a workspace and stores it. A head leads one project; a hiree works under a head. Heads and hirees store no workspace: theirs is their project's.
 - **Journal:** the append-only `registry_journal` table. Every change to a derived table is a journal row, and `verify` and `rebuild` replay the journal to reproduce those tables. **Generation:** the journal's highest sequence number. **Incarnation:** a random id per process; a cursor or token from another incarnation is not resumable.
-- **Shared entry:** the after-image of the shared tables a write changed, appended to the identity log. **Identity log:** the append-only log of shared entries, one per operator account. Sharing is `disabled`, `enabling`, `joining` or `enabled`; `hub_ready` records completion of the switch on this machine.
-- **Claim:** a cached record of which machine holds an agent or a role. On the hub the keys are `residence.<agent>` and `role.<name>`. The served `epoch` is the claim generation, not the encryption epoch or the KV revision. Generation 0 means unclaimed.
+- **Shared entry:** the after-image of the shared tables a write changed, appended to the identity log. **Identity log:** the append-only log of shared entries, one per operator account. Sharing is off by default; a machine can bootstrap an empty hub or install an existing hub registry.
+- **Claim:** a verified record of which machine holds an agent or a role, served from a local watch. The hub keys are `residence.<agent>` and `role.<name>`. The served `epoch` is the claim generation, not the encryption epoch or the KV revision. Generation 0 means unclaimed.
 - **Move and cut:** a move transfers an agent's claim and data from one machine to another. Its data travels as a cut: a sealed set of streams in engram's session door.
 - **Session binding:** an agent's session reference (`ref_kind`, `ref`) mapped to the host session (`harness`, `session_id`) and the runner that hosts it.
 - **Pin:** an exact package version recorded for an agent. **Catalog generation:** one machine-local set of an agent's installed packages, prepared, then activated. Not the same as the journal generation.
@@ -61,15 +61,15 @@ The binary picks its role from its own name: run as `ck-projects`, `ck-workspace
 
 One SQLite store in the folder the daemon's storage descriptor names, opened behind a single-writer lease. Migrations (`MIGRATIONS` in `crates/entorhinal-core/src/lib.rs`) run at open, and a binary refuses a store whose schema is newer than its own. The store's state falls into three tiers:
 
-1. **Shared, journal-derived:** `workspace`, `project`, `workspace_document`, `project_workspace`, `project_alias`, `project_root_key`, `catalog_pin_set`, `catalog_pin`, `user_profile`, `user_expertise`, `agent`, `agent_name_claim` and `member_name`. With sharing enabled, every change to them goes to the identity log. The list is in `shared_entry.rs`.
+1. **Shared, journal-derived:** workspaces and documents, projects and placement, root keys, package pins, user profile and expertise, agents and their names, and machine identities and names. Their shared changes go to the hub log when sharing is enabled. The table list is in `shared_entry.rs`.
 2. **Machine-local, journal-derived:** roots, bindings, approvals, owned remotes, workspace members and workspace roots. They are journaled so `verify` holds, but never sent: paths and authority belong to one machine. `DERIVED_TABLES` in `mutations.rs` lists every journal-derived table.
-3. **Machine-local, outside the journal:** session bindings and network history, the claim and role caches, move checkpoints and settings, consent requests, grants and audit, catalog registries, statuses, plans and generations, and the store's origin. The journal cannot rebuild them and nothing replicates them.
+3. **Machine-local, outside the journal:** session bindings and network history, local role enrollment and generation floors, hub write attempts, move checkpoints and settings, consent requests, grants and audit, catalog registries, statuses, plans and generations, and the store's origin. The journal cannot rebuild them and nothing replicates them.
 
 Package files live outside SQLite, in a content-addressed folder beside the store, and are re-verified on every read. At startup the module writes `engram-catalog.json` beside the store, telling engram's backup how to copy `store.db`.
 
 ## How a request runs
 
-**Startup.** The daemon starts the module with `--subc <connection file>`. In HELLO_ACK it supplies the storage descriptor and this machine's id. The module opens the store, retrying while an exiting predecessor still holds the lease, checks that the store was made on this machine (see the foreign-store rule), and starts its background tasks. Until the store is open, requests refuse `store_unavailable`.
+**Startup.** The daemon starts the module with `--subc <connection file>`. In HELLO_ACK it supplies the storage descriptor and this machine's id. The module opens the store, retrying while an exiting predecessor still holds the lease, checks that the store was made on this machine (see the foreign-store rule), and starts its background tasks. While storage is not ready, requests that need it refuse `store_unavailable`; a store still sharing the old way reports `legacy_sharing_unsupported` instead.
 
 **Admission.** Every route's principal, scope stamp and flow come from the daemon at bind, never from the request. Each operation then passes its own rules in `ProjectsHandler::admit_with` (`main.rs`):
 
@@ -96,7 +96,7 @@ A route opened under a flow's scope refuses every write (`flow_scope_not_admitte
 
 **A local write** is one SQLite transaction on the writer: it appends the journal row and updates the derived tables. The reply is stored with the request key, so a retry with the same key returns the same bytes.
 
-**A shared write** (sharing enabled) goes through `shared_write.rs`. After cutover, the writer records the attempt and appends at the expected hub head; it applies only after the append is confirmed directly or settled from the log. The legacy path prepares the local transaction and commits only when engram confirms the position. During migration, a switch marker freezes old writes; the hub snapshot and seeded claims must be verified before `hub_ready` permits hub writes.
+**A shared write** (sharing enabled) goes through `shared_write.rs`. The writer records the attempt and appends at the expected hub head. It applies only after the append is confirmed directly or settled from the log.
 
 **An operator-confirmed write** is validated against a read snapshot first, so a write that would fail never prompts. Then the daemon shows the presence prompt with no lock held, and the write path validates again, refusing `operator_approval_stale` if the change differs from what the operator approved. One prompt can be outstanding at a time.
 
@@ -104,7 +104,7 @@ A route opened under a flow's scope refuses every write (`flow_scope_not_admitte
 
 **Session registration** binds a session reference to a host session for one agent. Registering an existing session again under a new reference, harness or runner updates the same row in place. A watch of prefrontal's session-liveness bucket updates an in-memory mirror; observed deletes from an authoritative mirror queue binding end stamps for a background task.
 
-**A move** is admitted in one transaction that records a checkpoint only if no new session started. On the source, the move driver has every participant freeze and export the agent's data, seals the cut in engram's session door, and publishes the move. The receiving machine picks it up from its inbox, has the participants import the data, takes the claim, and activates them. Only after activation does the source release its copy. Each step is recorded before the next, is idempotent and survives a restart. `docs/agent-move-contract.md` defines every step and refusal.
+**A move** is admitted in one transaction that records a checkpoint only if no new session started. On the source, the move driver has every participant freeze and export the agent's data, seals the cut in engram's session door, and publishes the move. The receiver sees the move on the hub watch and stages the cut through its participants. The source hands residence to the receiver, which then activates the staged data. Only after activation does the source release its copy. Each step is recorded before the next, is idempotent and survives a restart. `docs/agent-move-contract.md` defines every step and refusal.
 
 **A package install** is two tool calls. `catalog_prepare` resolves, fetches and verifies the closure and asks each consumer module to check it, building a stored plan. `catalog_install` then shows the consent card and writes the pins, the catalog generation and any publisher grant in one transaction. Core activates the generation with `catalog.ack_activation`.
 
@@ -113,13 +113,13 @@ A route opened under a flow's scope refuses every write (`flow_scope_not_admitte
 All start after HELLO_ACK. Each holds the store weakly and takes a handle only for one blocking job, so none keeps the database open across a network wait.
 
 - **Hub log and KV**: tail `HUB_IDLOG` and watch `KV_residence`. Reconnects re-establish the streams and reconcile the local view before serving fresh claims. The only periodic hub requests during healthy idle operation are renewals for held role leases, each a CAS preceded by a fleet epoch read.
-- **Legacy sharing** (`catch_up.rs`, `claims.rs`, `roles.rs`): before `hub_ready`, catch-up and role refresh run every 30 s; claim refresh runs on startup, reconnect, registry changes and explicit refresh, with catch-up ticks retrying failures. None of these engram reads runs after cutover.
-- **Move driver** (`move_driver.rs`): drives open moves and releases finished cuts. It polls the engram inbox every 30 s only before cutover; afterward hub KV delivers new move records.
+- **Hub setup and recovery** (`catch_up.rs`): resumes a saved bootstrap plan, joins an existing hub from an empty registry, or starts the installed log tail.
+- **Move driver** (`move_driver.rs`): watches for hub move records, drives local checkpoints and releases finished cuts.
 - **Session liveness** (`liveness_bus.rs`): watches `prefrontal.session-liveness`, replays its rows and reconciliation marker, and clears and retries the mirror after an outage.
 - **Session upkeep** (`session_upkeep.rs`): writes end times from observed authoritative bucket deletes and prunes bindings that ended more than 30 days ago.
 - **Catalog status poll** (`catalog_poll.rs`): refreshes package status for the registry scopes agents' pins use, at startup and then hourly at a stored random offset, backing off up to 6 h after failures. Live flows requiring capabilities also refresh every ten minutes, retry failures after one minute (doubling to ten), and become stale after fifteen minutes without confirmation.
 - **Starter bundle seed** (`catalog_seed.rs`): seeds the content store once if a starter bundle is present and the store is empty.
-- **Bus change publisher** (`bus_changes.rs`): keeps six revision markers in the account-local `entorhinal.changes` KV bucket current after committed journal, role-cache and catalog-status changes and changes to the cached fleet epoch view; retries bus outages without delaying reads.
+- **Bus change publisher** (`bus_changes.rs`): keeps six revision markers in the account-local `entorhinal.changes` KV bucket current after journal commits, catalog status changes and changes to the cached fleet epoch view; retries bus outages without delaying reads.
 
 ## Rules that bite
 
@@ -138,12 +138,12 @@ All start after HELLO_ACK. Each holds the store weakly and takes a handle only f
 
 ## Health
 
-The module reports `Ok`; `Degraded` while it waits for a predecessor's lease, when the store is from another machine, when the identity log is stalled or failing, when this machine's author identity conflicts, or after move errors, rejected inbox entries or a move task panic; and `Failing` while the store is not open. Its metrics cover the generation, query counts and latency, `readyAfterMs`, liveness counters, identity-log state and progress, claim refresh counters, open moves, catalog polling, open watches and pending cut releases.
+The module reports `Ok`; `Degraded` while it waits for a predecessor's lease, when the store is from another machine, when the identity log is stalled or failing, or after move errors or a move task panic; and `Failing` while the store is not open. Its metrics cover the generation, query counts and latency, `readyAfterMs`, liveness counters, identity-log state and progress, hub watches and leases, open moves, catalog polling, open watches and pending cut releases.
 
 ## Further reading
 
 - [Data model](docs/data-model.md): tables, journal, migrations.
 - [Module surface](docs/module-surface.md): every operation, its admission and reply.
-- Contracts: [identity log](docs/identity-log-contract.md), [agent moves](docs/agent-move-contract.md), [consent](docs/consent-contract.md), [session liveness](docs/session-liveness-contract.md), [memory context](docs/memory-context.md), [catalog](docs/catalog.md).
+- Contracts: [hub log](docs/hub-log-contract.md), [agent moves](docs/agent-move-contract.md), [consent](docs/consent-contract.md), [session liveness](docs/session-liveness-contract.md), [memory context](docs/memory-context.md), [catalog](docs/catalog.md).
 - Guides: [projects and roots](docs/projects-and-roots.md), [agents](docs/agents.md), [sharing between machines](docs/sharing.md), [moving agents](docs/moves.md).
 - `test-vectors/`: byte-exact sample replies other modules pin.

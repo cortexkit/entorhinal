@@ -28,10 +28,10 @@ Pure functions over bytes: every byte, trust input and time is an argument. `jcs
 - `mutations.rs`: project, workspace and root writes, the journal, request-key replies, `verify`, `rebuild` and `DERIVED_TABLES`.
 - `binding.rs`, `root_keys.rs`, `ownership.rs`: checkout bindings and approval, machine-neutral root keys, owned remotes.
 - `agent/`: agent identity. `schema.rs` (migration 4), `validate.rs` and `limits.rs` (field rules), `names.rs` (name claims), `store.rs` (writes), `reads.rs` and `fleet.rs` (reads), `feed.rs` (`agent.changes`), `carry.rs` (workspace placement of heads and hirees), `avatars.rs`, `import.rs` (the one-time import from core), `consent.rs` (machine-local consent state, migration 10).
-- `shared_entry.rs`, `remote_apply.rs`: building shared entries from after-images and applying entries from the identity log. `log_schema.rs`, `enable_state.rs`, `pending.rs`: the local log state, enabling, and pending shared writes.
+- `shared_entry.rs`, `remote_apply.rs`: building shared entries from after-images and applying entries from the hub identity log. `log_schema.rs`, `enable_state.rs`, `pending.rs`: local log state, snapshot install and the hub write ledger.
 - `session_lifecycle.rs`, `session_network.rs`, `session_carry.rs`, `session_residence.rs`: session bindings, their network history, carrying them in a move, and the residence answer used on restore.
-- `claim_cache.rs`, `role_cache.rs`, `where_notify.rs`: cached agent and role claims, and the invalidation signal for location watches.
-- `move_record.rs`, `move_store.rs`: move and inbox record codecs and the machine-local move checkpoint.
+- `claim_cache.rs`, `role_cache.rs`, `where_notify.rs`: residence read shapes, local role enrollment and generation floors, and location-watch invalidation.
+- `move_record.rs`, `move_store.rs`: participant plan validation and the machine-local move checkpoint.
 - `catalog.rs`, `catalog_trust.rs`, `catalog_grants.rs`, `catalog_agent.rs`, `catalog_resolution.rs`: registries and statuses, publisher grants, pins, plans and generations, and adapting stored pins to the pure resolver.
 - `memory.rs`, `context.rs`: project domains, workspace documents and the `context.*` reads.
 - `user_profile.rs`, `store_origin.rs`: the user profile, and which machine made the store.
@@ -42,15 +42,15 @@ Pure functions over bytes: every byte, trust input and time is an argument. `jcs
 
 - `main.rs`: the module. Manifest, `ProjectsHandler`, route admission (`admit_with`, `authorize_write`), the two dispatch paths (`execute` for store operations, `handle_served_request` for operations that wait on a prompt, the shared writer or another module), health, startup and the background-task starts.
 - `cli.rs`: the `ck projects`, `ck workspaces`, `ck agents`, `ck roles` and `ck packages` faces. `catalog_cli.rs` (the `ck packages` verbs) and `workspace_document_cli.rs` (`ck workspaces document`) are submodules of it.
-- Identity log: `shared_write.rs` (one shared write at a time), `catch_up.rs`, `enable.rs`, `log_client.rs` (engram's `agent-sync` log), `member.rs` (machine display names).
-- Claims and roles: `claims.rs`, `roles.rs`, `record_client.rs` (engram's `record.*`), `claim_codec.rs`.
+- Hub identity log: `shared_write.rs` (write routing), `hub_identity_log.rs` and `hub_write.rs` (tail and writer), `catch_up.rs`, `enable.rs` and `hub_switch/snapshot.rs` (startup, enable and join), `member.rs` (machine display names).
+- Residence and roles: `hub_residence.rs` (KV watch), `claims.rs` and `roles.rs` (served operations), `role_leases.rs` (lease service), `claim_codec.rs` (claim wire types).
 - Agents: `agent_ops.rs` (writes), `agent_reads.rs` (reads and the `agent.changes` long-poll), `watches.rs` (the two watches).
 - Sessions: `sessions.rs` (registration, end, network, reads and the liveness mirror), `session_upkeep.rs` (end times and pruning).
-- Moves: `move_admission.rs`, `move_driver.rs`, `move_source.rs`, `move_receiver.rs`, `move_ops.rs` (status and operator controls), `cut_release.rs`, `participant_discovery.rs` and `participant_client.rs` (agent-data participants), `door_client.rs` (engram's session door). entorhinal's own participant data lives in `catalog_move/` (package files) and `session_move/` (session bindings).
+- Moves: `move_admission.rs`, `move_driver.rs`, `move_source.rs`, `move_receiver.rs`, `hub_moves.rs` (hub record), `move_ops.rs` (status and operator controls), `cut_release.rs`, `participant_discovery.rs` and `participant_client.rs` (agent-data participants), `door_client.rs` (engram's session door). entorhinal's own participant data lives in `catalog_move/` (package files) and `session_move/` (session bindings).
 - Agent tools and consent: `tool_provider.rs` (catalog and caller admission), `tool_writes.rs`, `consent.rs`, `consent_client.rs` (Cingulate), `permissions.rs` (`permissions/v1`, audit, hire caps).
 - Catalog: `catalog_ops.rs` (registries and blob reads), `catalog_network.rs` (HTTPS client), `catalog_trust.rs` (registry verification and the pinned `CORTEXKIT_ROOT`), `catalog_blob.rs` (content-addressed files), `catalog_agent.rs` (prepare, install, activation), `catalog_consumer.rs`, `catalog_grants.rs`, `catalog_poll.rs`, `catalog_seed.rs`, `catalog_sql.rs` (blocking-pool SQL with deadlines), `catalog_publish/`.
 - Other operations: `memory_context.rs`, `user_profile.rs`, `store_origin.rs`.
-- Test-only (compiled under `cfg(test)`): `fake_*.rs` (in-process daemon, log, records, session door, Cingulate, participants, registry), `served_vectors.rs` (generates and checks `test-vectors/`), `two_machine_acceptance.rs` and `two_machine_acceptance/` (two stores talking through stand-ins), `cut_barrier_rehearsal.rs`, `consent_decoder.rs` (Cingulate's decoder ported as an oracle, included by `fake_cingulate.rs`), and the `*_tests.rs` files.
+- Test-only (compiled under `cfg(test)`): `fake_*.rs` (in-process daemon, session door, Cingulate, participants, registry), `served_vectors.rs` (generates and checks `test-vectors/`), `hub_transport/tests/live/` (live hub tests), `two_machine_acceptance.rs` and `two_machine_acceptance/` (two stores talking through stand-ins), `cut_barrier_rehearsal.rs`, `consent_decoder.rs` (Cingulate's decoder ported as an oracle, included by `fake_cingulate.rs`), and the `*_tests.rs` files.
 - `tests/`: integration tests that run the built binary (manifest, CLI faces and launch, binary names, retry quoting, Windows ACLs) and `real_daemon_e2e.rs`, which needs a sibling `subconscious` checkout and is ignored by default. `tests/fixtures/` holds frozen Cingulate and permissions samples.
 
 ## Where to add new code

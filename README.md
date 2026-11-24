@@ -106,7 +106,7 @@ maps the code.
 
 - Reference: [data model](docs/data-model.md),
   [module surface](docs/module-surface.md).
-- Contracts: [identity log](docs/identity-log-contract.md),
+- Contracts: [hub log](docs/hub-log-contract.md),
   [agent moves](docs/agent-move-contract.md),
   [consent](docs/consent-contract.md),
   [session liveness](docs/session-liveness-contract.md).

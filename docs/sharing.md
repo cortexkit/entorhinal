@@ -1,17 +1,16 @@
 # Sharing between machines
 
-How to turn on the shared identity log so that projects, workspaces and agents
-are the same on each of your machines, and how to name each machine. The rules behind
-these commands are in [identity-log-contract.md](identity-log-contract.md).
+How to share projects, workspaces and agents across your machines through the
+identity log on your NATS hub, and how to name each machine. The rules behind
+these commands are in [hub-log-contract.md](hub-log-contract.md).
 
 What is shared: projects, workspaces, project placement, root keys, agents and
 their names, and machine display names. What is not: folder paths, bindings,
 approvals, owned-remote choices, workspace root folders, sessions, consent
-grants, hire caps and move state. Each machine keeps its own.
+grants, hire caps and local move checkpoints. Each machine keeps its own.
 
-The log is stored by engram, so engram must be running and must accept this
-machine as a member of the log. entorhinal does not manage that membership; a machine
-that is not a member gets `identity_log_not_member`.
+The hub also coordinates agent residence, role leases and agent moves. Those
+records are separate from the identity log.
 
 ## Check the current state
 
@@ -19,8 +18,9 @@ that is not a member gets `identity_log_not_member`.
 ck projects log status
 ```
 
-Reads local state only: `state` (`disabled`, `enabling`, `joining` or
-`enabled`), `lastAppliedPosition`, `lastSeenHead` and `pendingWriteCount`.
+Reads local state only: the sharing state, `lastAppliedPosition`,
+`lastSeenHead`, `pendingWriteCount`, and any recorded error. See
+[Status](hub-log-contract.md#status) for the reply fields.
 
 ## Enable on the first machine
 
@@ -35,8 +35,8 @@ Reads local state only: `state` (`disabled`, `enabling`, `joining` or
    ck projects log enable --without-agents
    ```
 
-   This writes a snapshot of this machine's projects, workspaces and agents to the
-   log.
+   Confirm the presence prompt. On an empty hub, this writes a snapshot of this
+   machine's shared registry. Declining leaves sharing off and publishes nothing.
 
 Refusals, all before anything changes:
 
@@ -46,10 +46,11 @@ Refusals, all before anything changes:
 | `invalid_request` | `--without-agents` was passed but agents or an import exist. |
 | `authority_not_cut_over` | Agents exist but the import was never completed. |
 | `join_requires_empty_registry` | The log already has entries from another machine and this registry is not empty (see below). |
-| `engram_unavailable`, `engram_key_unavailable`, `identity_log_not_member` | engram cannot be used from this machine. |
+| `hub_not_ready` | The hub backend is not ready to enable sharing. |
 
 Verify: `ck projects log status` shows `enabled`, with
 `lastAppliedPosition` equal to `lastSeenHead` and `pendingWriteCount` 0.
+`pendingWriteCount` counts retained pending rows, not hub write attempts.
 
 ## Join from another machine
 
@@ -59,19 +60,22 @@ A machine joins with an **empty** registry: no projects, workspaces or agents.
 ck projects log enable
 ```
 
-The machine reads the log from the start, installs the first machine's snapshot and
-every later entry, and reaches `enabled` once it has caught up. Then give each
+An empty registry can also join automatically when it finds a complete hub
+snapshot. Enabling explicitly starts the join without waiting for that check.
+The machine installs the snapshot and follows later entries. Give each
 shared project a folder here with `ck projects attach`
 ([projects-and-roots.md](projects-and-roots.md#attach-a-checkout-on-another-machine)).
 
-A machine that already has a registry cannot join a log another machine started
-(`join_requires_empty_registry`, with the local counts). It can only replace
-the log's contents when it wrote every entry in it itself.
+A non-empty local registry cannot join a populated hub
+(`join_requires_empty_registry`, with the local counts). If another machine
+starts the hub while the presence prompt is open, this machine checks the hub
+again after confirmation and follows the same join rule instead of saving a
+bootstrap plan.
 
-If enabling or joining is interrupted, the machine stays in `enabling` or
-`joining` and finishes in the background; running `ck projects log enable`
-again resumes it. While it lasts, shared writes refuse
-`identity_log_enabling`.
+If a first-machine enable is interrupted after saving its plan, the machine
+finishes that plan in the background, including after a restart. Running
+`ck projects log enable` again resumes it. Shared writes refuse
+`identity_log_enabling` during bootstrap.
 
 ## Name each machine
 
@@ -86,8 +90,16 @@ It refuses `identity_log_disabled` before the log is enabled,
 `identity_log_enabling` during bootstrap, and `self_author_unknown` until this
 machine has read its own identity from the log.
 
-Other machines learn the name at their next catch-up. Reverse: set a different
+Other machines learn the name through the log tail. Reverse: set a different
 name.
+
+## Take a role
+
+`role.take` requires hub sharing and operator confirmation. After checking
+the caller and validating the request, it refuses `identity_log_disabled`
+when sharing is not enabled, or `hub_not_ready` when sharing is enabled but
+the hub backend has not been selected. Neither refusal prompts or writes.
+Local role leases still work with sharing off.
 
 ## Turning sharing off
 
@@ -95,13 +107,14 @@ There is no operation that disables the log once it is enabled.
 
 ## When something is wrong
 
-- `pendingWriteCount` above 0 after a command reported
-  `engram_outcome_unknown`: the write may or may not have landed. The next
-  catch-up (within 30 seconds, or before the next shared write) settles it.
-  Retry the command with the printed retry line if it did not land.
-- `identity_log_stalled`: catch-up stopped at an entry it could not apply or
-  verify, or at a gap. Shared writes refuse until it moves again. The module's
-  health shows the reason (`log_gap`, `log_verify_failed`, `apply_failed`,
-  `identity_log_invariant`). A log head lower than this machine has already
-  applied is ignored and reported as `log_head_regressed`.
-- `identity_log_contended`: other machines kept appending first; retry.
+- `legacy_sharing_unsupported` means this registry store shares through engram.
+  This build carries over **neither shared nor local-only data** from that
+  store. Move its folder aside and keep it; do not delete it. Start with a new,
+  empty registry. If this account's registry already lives on the hub, the
+  computer joins it automatically; run `ck projects log enable` to join at once.
+  Otherwise, to start a new shared registry, import agents first and run
+  `ck projects log enable`, or run `ck projects log enable --without-agents`,
+  then confirm the prompt.
+- If the hub log is not ready or has stopped advancing, local reads still
+  use the last committed state. Check `ck projects log status` and
+  `ck health entorhinal` before retrying a shared write.

@@ -43,9 +43,9 @@ a query or a mutation; `ck-entorhinal --manifest` prints it.
 
 entorhinal provides `project-identity/v1`, `agent-identity/v1`,
 `permissions/v1` and `tool-provider/v1` (with the call-modes capability of the
-tool-provider role). It requires none. It calls engram only to write or read
-shared state and serves every read without it, so declaring engram `required`
-would make the daemon refuse reads while engram is down.
+tool-provider role). It requires none. Shared registry state lives on the hub;
+reads use the local store and watches. Agent moves use engram's session door
+to carry data, not to coordinate the move.
 
 ## Health
 
@@ -56,7 +56,15 @@ contains `count`, `totalUs`, `maxUs`, `over500ms` and `over3s`. `storeUnavailabl
 counts requests refused before storage was ready, and `readyAfterMs` records
 the first successful store-open time from process start. Requests slower than
 500 ms also emit one fleet warning; a `resolve` warning includes its
-`canonical_root`.
+  `canonical_root`.
+
+The health shape is unchanged. The following fields no longer change:
+
+| Value | Metric keys |
+|---|---|
+| `0` | `logOwnEntriesAppliedFromLog`, `claimRefreshed`, `claimConflicts`, `claimFailed`, `claimVersionUnknown`, `claimSubjectMismatch`, `claimMalformed`, `selfAuthorConflicts`, `moveInboxRejected` |
+| `false` | `roleRefreshFailed` |
+| `null` | `claimError` |
 
 Moves add three counters, each counting since the module started:
 `sessionBindingsCarried` (session bindings this machine wrote into the
@@ -89,18 +97,20 @@ owning operation for data.
 | `registry` | `{"generation":N,"incarnation":"…"}` | `enumerate`: journal head and process incarnation; any journal write may advance it. |
 | `agents` | `{"generation":N,"incarnation":"…"}` | `agent.changes`: newest identity-change journal sequence, excluding project-only writes. |
 | `profile` | `{"token":"…"}` | Unscoped `user.get`: exactly its content-derived change token. |
-| `role.connector_home` | `{"epoch":N}` | `role.read`: this machine's cached claim epoch for `connector_home`. |
+| `role.connector_home` | `{"epoch":0}` | Compatibility marker. It does not track hub role epochs; read `role.read` for the role's current view. |
 | `catalog.status` | `{"generation":N}` | `catalog.status_watch`: the process-local pinned-version status generation. |
 | `fleet_epoch` | `{"generation":N,"incarnation":"…"}` | `fleet.epoch_current`: advances when the verified committed hub epoch or highest committed epoch held here changes. |
 
-One background task publishes all six keys on startup, then only values that
-differ from its last successful puts. It wakes on committed journal writes,
-committed role-cache updates, catalog status changes and fleet epoch cache changes. It uses a separate
-SubcConsumer client connection and BusClient credentials, not the module's
+One background task publishes all six keys on startup, including the zero
+epoch marker. It wakes on journal commits, catalog status changes and fleet
+epoch cache changes, and publishes only values that differ from its last
+successful puts. When the bus connection changes, it republishes every key.
+Role updates do not wake it. It uses a separate SubcConsumer client connection
+and BusClient credentials, not the module's
 registered connection. A missing bucket or unavailable bus is retryable with
 1-second exponential backoff capped at 60 seconds: one warning starts the
-outage and one recovery message reports the failed-attempt count. Stores from
-another machine do not publish. Existing replies and samples are unchanged.
+outage and one recovery message reports the failed-attempt count. Nothing is
+published without an open store. Stores from another machine do not publish.
 
 ## Admission, in general
 
@@ -219,7 +229,7 @@ through one channel-0 control op that entorhinal lists in its HELLO
 
 | Op | Reply |
 |---|---|
-| `projects.enumerate` | `{op: "projects.enumerate", result}`, where `result` equals a routed `enumerate {}` result (`fileId` and `incarnation` included). It is read on the blocking pool with a 5 s deadline, inside the daemon's 10 s timeout. Before the store opens, or on a failed or slow read, it answers an ERROR frame with code `unavailable`. |
+| `projects.enumerate` | `{op: "projects.enumerate", result}`, where `result` equals a routed `enumerate {}` result (`fileId` and `incarnation` included). It reads on the blocking pool with a 5 s deadline, inside the daemon's 10 s timeout. Before the store opens, or on a failed or slow read, it answers with an ERROR frame. |
 
 Test: `projects_enumerate_control_op_matches_routed_enumerate`.
 
@@ -277,8 +287,8 @@ scopes refuse `invalid_request`; bad values refuse `invalid_value`.
 Direct writes validate before prompting, hold no store/writer lock during
 confirmation, then revalidate and apply. The summary names the field, exact
 scope and new value or `clear`; summaries over 200 characters refuse
-`operator_summary_too_long`, never truncate. The normal confirmation busy,
-declined and presence-unavailable refusals apply. Longer values can be relayed
+`operator_summary_too_long`, never truncate. The usual operator confirmation
+refusals apply. Longer values can be relayed
 through core or callosum.
 
 The two shared tables travel through the identity log as `user.set` entries and
@@ -434,11 +444,14 @@ are not open to every caller.
 
 ## Sessions, claims and roles
 
-Claims say which of the operator's machines holds an agent or a role. Before
-cutover they are refreshed from engram; after `hub_ready`, the hub's
-`KV_residence` watch maintains the local cache. Every read here answers from the
-cache and never waits on either service. If the hub view is not ready or the
-watch is down, callers must not treat a stale claim as authority to act.
+Claims say which of the operator's machines holds an agent or a role. The
+hub's `KV_residence` watch maintains the local view; reads never wait on the
+hub. Callers must not treat a stale claim as authority to act. Without a
+selected hub, agent whereabouts report `unclaimed` at epoch 0: known on a
+local store with sharing disabled, otherwise unknown and stale. Role reads
+without a selected hub report an unobserved role: epoch 0, no holder or
+source, unknown and stale. The fence version is 0. Local role leases still
+work with sharing disabled.
 
 `agent.register_session` accepts optional `role: "head" | "delegated"`.
 Omission stores `head`, including for existing bindings; any other value
@@ -467,36 +480,38 @@ stay on the computer that launched them and do not block a move.
 | `agent.session_liveness` | query | any | `active`, `gone` or `unknown` for up to 256 references, in order, from the trusted `prefrontal.session-liveness` bus mirror; `unknown` while the watch is unavailable or unreconciled. See [session-liveness-contract.md](session-liveness-contract.md). |
 | `agent.where` | query | any | Which machine holds an agent, from the cached claim, plus any blocked move's participant and ref explanation. |
 | `agent.where_many` | query | any | Cached claim results for 1–64 agent ids in request order; unknown agents are omitted. |
-| `node.self {}` | query | any | This machine's identity-log identity: `{author: string or null, display_name: string or null, box_id?: string, sharing: "disabled" or "enabling" or "joining" or "enabled"}` inside the usual `{result: ...}` envelope. Unknown params refuse `invalid_request`. |
+| `node.self {}` | query | any | This machine's identity-log identity: `{author: string or null, display_name: string or null, box_id?: string, sharing: "disabled" or "enabling" or "enabled"}` inside the usual `{result: ...}` envelope. Unknown params refuse `invalid_request`. |
 | `agent.fleet_identity_watch` | watch | any | Stream of changes to `agent.fleet_identity`. Opens with `{token?}` and sends `resync` or `changes` notices; on `resync`, read `agent.fleet_identity` once. |
 | `agent.where_watch` | watch | any | Stream of changes to whereabouts. Opens with `{agentIds?, cursor?}` and sends `resync` or `changes` notices carrying a cursor; on `resync`, read `agent.where_many` once. |
 | `catalog.status_watch` | watch | any | Pinned package status invalidations. Opens with `{token?}`; `changes` lists `{name, version}` identities whose state, blocking judgement or stale marker changed. `resync` requires rereading generation or context status. Tokens bind the process incarnation and local status generation. Shares the 16-watch cap and 192 KiB notice limit. |
-| `agent.refresh_claims` | mutate | Direct | Refresh live agents' cached claims from engram before cutover; hub claims arrive through the watch. |
+| `agent.refresh_claims` | mutate | Direct | Compatibility operation. Refuses `identity_log_disabled` when sharing is not enabled and `hub_claims_watched` when the hub backend is selected. While enabled but waiting for selection, returns empty refresh counts. |
 | `role.read` | query | any | Which machine holds a role, from the cached claim. |
-| `role.fence` | query | any | Cached fence for curation; after cutover the fence token is the KV revision of `role.<name>`. |
-| `role.take` | mutate | Direct, with operator confirmation | Take a role or request handback. On the hub, setting the preferred machine while another current member holds the role replies `{epoch, held_here: false, handback_requested: true}`; a retry replays that outcome, not current possession. |
+| `role.fence` | query | any | Cached fence for curation; on the hub the fence version is the KV revision of `role.<name>`. |
+| `role.take` | mutate | Direct, with operator confirmation | Take a role or request handback on the hub. Setting the preferred machine while another current member holds the role replies `{epoch, held_here: false, handback_requested: true}`; a retry replays that outcome, not current possession. Without a selected hub, refuses `identity_log_disabled` if sharing is not enabled or `hub_not_ready` if it is. |
 | `agent.take` | mutate | Direct, with operator confirmation | On a ready hub, take an agent whose holder can no longer serve it: a removed computer, a computer's earlier membership (it was removed and later paired again, so its old claims lapsed), or a legacy Engram author not mapped to a hub member (`engram:<author>`). It also claims agents carried over from Engram that have no location record on the hub yet. Refuses `holder_is_member` for a current holder, `claim_pending` while the creator must write the first claim, `claim_integrity_failed` for a refused claim, `hub_not_ready` while the hub view catches up, and `caller_forbidden`, `operator_declined`, or `operator_presence_unavailable` when authorization or confirmation fails. |
 
-`node.self` reads one local read-only snapshot without contacting engram or
+`node.self` reads one local read-only snapshot without contacting the hub or
 writing a journal entry. `author` is the opaque identity-log author compared with
 `agent.where` and `agent.where_many`'s `holder`, or null until this machine has
 learned its author. `display_name` is this author's own member name, as set by
 `ck projects log name` (`member.set_name`): the same value another machine sees
 as `holder_name`, or null when unset or when there is no author. `sharing` is the
-state reported by `identity_log.status`. `box_id` is this computer's daemon
+local store's sharing mode, without the `identity_log.status` health overlay.
+`box_id` is this computer's daemon
 machine id (32 lowercase hex), present once HELLO_ACK provides it even when
 sharing is disabled.
 
-After cutover, holder ids are daemon box ids, not transport fingerprints. Use
+Hub holder ids are daemon box ids, not transport fingerprints. Use
 the Callosum roster to map a box id to its current fingerprint. A migrated
 holder without a known box is `engram:<author>` and must not be dialed or
-looked up in the roster. Before cutover, `holder` is the engram author.
+looked up in the roster.
 `agent.where` and each `agent.where_many` row include `holder_box` when the box
 is known; `holder_name` remains the display name. A changed box mapping
-invalidates `agent.where_watch` just like a changed member name.
+invalidates `agent.where_watch` just like a changed member name. With the hub
+backend selected, an observed claim for this computer's own box remains
+`held_here` but stale while membership loads.
 
-Hub samples supplement the legacy vectors because both backends still serve
-clients during rollout: [single location](../test-vectors/agent-sessions-v1/where-hub.json),
+Hub examples: [single location](../test-vectors/agent-sessions-v1/where-hub.json),
 [batch locations](../test-vectors/agent-sessions-v1/where-many-hub.json), and
 [fleet identity](../test-vectors/agent-identity-reads-v1/fleet-identity-hub.json).
 Fleet identity identifies agents, not holders; join it to the locations by
@@ -530,7 +545,7 @@ making it writable. Its precedence is:
    table. `holder`, `holder_name` and claim fields are omitted in this branch.
 3. The agent has a local open move, using the same definition as `agent.where`:
    `moving`, with `agent_id`. Wait before restoring writability.
-4. An unread claim with sharing on or joining, a stale or integrity-failed claim,
+4. An unread claim when sharing is not disabled, a stale or integrity-failed claim,
    or an epoch at least 1 without this machine's author identity: `unknown`.
 5. A usable claim at epoch at least 1: `here` when held by this machine's author,
    otherwise `elsewhere`.
@@ -543,7 +558,7 @@ Only `here`, or `unclaimed` at epoch 0, permits making the restored session
 writable; `elsewhere` and `unknown` require read-only access. Residence is stricter
 than `agent.where`: the latter retains its existing status even for stale claims,
 refuses integrity-failed claims, and reports a positive-epoch claim without self
-identity as `held_elsewhere`. Neither read contacts engram or the hub. Served examples are in
+identity as `held_elsewhere`. Neither read contacts the hub. Served examples are in
 [`agent-session-residence-v1`](../test-vectors/agent-session-residence-v1/README.md).
 
 Registering a different `ref` for the same `(harness, session_id)`, `agent_id`
@@ -617,8 +632,8 @@ the approved attempt without prompting again. Other callers of
 `agent.refresh_claims` and `role.take` get `caller_forbidden`.
 
 Tests: `refresh_admission_empty_disabled_and_sync_seam_are_closed`,
-`role_take_is_confirmed_direct_only_and_ledger_precedes_prompts`,
-`role_lost_reply_retries_exact_attempt_without_another_prompt`.
+`role_take_refuses_before_hub_selection_without_prompting_or_writing`,
+`lease_handback_role_take_replays_preference_and_force_takes_removed_holder`.
 
 ## Moving agents between machines
 
@@ -636,12 +651,12 @@ Rules are in [agent-move-contract.md](agent-move-contract.md); the guide is
 
 ## Shared identity log
 
-Rules are in [identity-log-contract.md](identity-log-contract.md); the guide
+Rules are in [hub-log-contract.md](hub-log-contract.md); the guide
 is [sharing.md](sharing.md).
 
 | Operation | Kind | Who | What it does |
 |---|---|---|---|
-| `identity_log.status` | query | any | Local log state, progress and pending writes, without contacting engram. |
+| `identity_log.status` | query | any | Local log state, progress and pending writes, without contacting the hub. |
 | `fleet.epoch_current {}` | query | any | Cached `{current?, highest_held?}`: the committed epoch named by the verified hub record and the highest committed epoch in this computer's vault. Pending mints do not count. Omit unknown members; reject unknown params with `invalid_request`. The read never contacts the hub or vault. Hold messages above `current` rather than dropping them: this computer's view can briefly lag another computer's rotation. |
 | `identity_log.enable {without_agents?}` | mutate | Direct | Enable the shared log, or join it. |
 | `member.set_name {display_name}` | mutate | Direct | Name this machine in the shared log. |
@@ -661,6 +676,7 @@ A refusal is an error envelope with a `code`, a `message` and sometimes a
 | `unknown_method` | No such operation. |
 | `storage_unavailable` | The store is not open yet. |
 | `store_unavailable` | The store could not be opened at startup. |
+| `legacy_sharing_unsupported` | The store still shares the old way and cannot open. See [the recovery instructions](sharing.md#when-something-is-wrong). |
 | `storage_error` | A database error. |
 
 Operation-specific codes are listed in the contracts.

@@ -6,8 +6,9 @@ commands are in [agent-move-contract.md](agent-move-contract.md).
 
 ## Before you start
 
-- The shared identity log is enabled on both machines, and the target machine has a
-  display name ([sharing.md](sharing.md)).
+- Hub sharing is enabled on both machines, and the target machine has a display
+  name ([sharing.md](sharing.md)). The hub coordinates the move; the session
+  door carries the data.
 - This machine holds the agent: `ck agents where <agent>` names this machine.
 - The agent is idle: none of its sessions is running, and every module that
   keeps its data reports it idle.
@@ -45,12 +46,13 @@ Common refusals, before anything is written:
 | Code | What to do |
 |---|---|
 | `agent_busy` | The detail lists each busy session or module and why (`session_active`, `liveness_unknown`, a module's reason). End the sessions and try again. |
-| `not_holder`, `claim_stale`, `claim_integrity_failed` | Run `ck agents where <agent> --refresh` and check which machine holds the agent. |
+| `not_holder`, `claim_integrity_failed` | Run `ck agents where <agent> --refresh` and check which machine holds the agent. |
 | `unknown_member` | No machine has that display name. |
 | `invalid_request` | The target is this machine, or the arguments are malformed. |
 | `move_in_progress`, `move_cap` | The agent already has an open move, or this machine has four. |
 | `participant_unavailable` | A module that keeps agent data is missing or not ready. |
 | `identity_log_disabled` | Enable the log first. |
+| `hub_not_ready` | Wait for the hub backend and residence watch, then try again. |
 
 If the command reports an unknown outcome, run the printed retry line: it
 reuses the request key and returns the existing move instead of starting a
@@ -129,8 +131,8 @@ Approve at the presence prompt. Run it on the machine whose side can still stop:
 
 - On the **receiver**, until it starts activating the agent (steps up to
   `claimed`).
-- On the **source**, only while the receiver has not yet staged the move. After
-  that, the source's request is cleared and says the receiver must abort.
+- On the **source**, until the handoff of residence starts. After that, the
+  source's request is cleared and says the receiver must abort.
 
 Once the receiver has started activating the agent, the move always
 completes; the command refuses

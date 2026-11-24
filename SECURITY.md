@@ -71,7 +71,7 @@ every operation.
   never skipped. Tests: `read_requires_author_and_catch_up_stalls`,
   `s3_member_author_mismatch_rolls_back_and_signer_is_not_author`,
   `forged_or_malformed_supersedes_stall_joiners_members_and_restarted_members`.
-  See [docs/identity-log-contract.md](docs/identity-log-contract.md).
+  See [docs/hub-log-contract.md](docs/hub-log-contract.md).
 - **Shared authority.** Consent grants, consent requests, the audit, hire caps,
   move checkpoints, session bindings and cached claims are machine-local. They
   are never written to the identity log, so another machine's state never

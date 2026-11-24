@@ -56,7 +56,6 @@ that closes loses its authority.
 
 Tests: `every_tool_admits_only_its_table_role_before_key_or_arguments`,
 `bind_captures_scope_epoch_and_mode_and_route_gone_drops_authority`,
-`agent_tools_refuse_cached_claims_held_elsewhere_even_with_standing_grants`,
 `every_write_validates_printable_ascii_request_keys_before_other_arguments`.
 
 ## 3. Requests
@@ -191,7 +190,7 @@ commit together. If the audit row cannot be written, nothing commits and a
 retry applies the write once.
 
 A tool write that changes shared state goes through the shared-log writer like
-any other ([identity-log-contract.md](identity-log-contract.md)). Its entry
+any other ([hub-log-contract.md](hub-log-contract.md)). Its entry
 carries the authorization (card id and answer, grant id, or `own_hire`), so
 `verify` and `rebuild` on any machine need no live card or grant.
 

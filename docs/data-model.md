@@ -2,7 +2,7 @@
 
 entorhinal keeps everything in one SQLite database per machine: the registry
 journal, the tables derived from it, and machine-local operational state. This
-document lists the tables, says which are shared through the identity log and
+document lists the tables, says which are shared through the hub's identity log and
 which stay on the machine, and describes the journal and migrations.
 
 Code: `crates/entorhinal-core/src/lib.rs` (opening, migrations 1, 2, 5 and 8),
@@ -15,8 +15,9 @@ Code: `crates/entorhinal-core/src/lib.rs` (opening, migrations 1, 2, 5 and 8),
 - **Location.** The subc daemon chooses the database path and passes it to the
   module in a storage descriptor when the module starts (`on_hello_ack` in
   `crates/entorhinal-module/src/main.rs`). entorhinal never picks or guesses a
-  path. A missing or invalid descriptor makes every request refuse
-  `store_unavailable`.
+  path. Requests that need the store fail with `store_unavailable` if it could
+  not be opened. Stores that share the old way fail instead with
+  `legacy_sharing_unsupported`; see [Sharing between machines](sharing.md#when-something-is-wrong).
 - **Permissions.** The storage library creates the store folder and files
   owner-only. See [SECURITY.md](../SECURITY.md).
 - **One writer.** Opening the store takes a single-writer lease, a kernel
@@ -58,31 +59,32 @@ Rules:
    tokens, epochs, agent after-images, the authorization of a tool write), so
    replay never re-reads the disk, re-validates, or mints new values.
 3. Writes that do not change the derived tables never touch the journal:
-   session bindings, claim and role caches, move checkpoints, consent state and
+   session bindings, local role enrollment, move checkpoints, consent state and
    the liveness mirror.
 
 Tests: `journal_principal_labels_are_pinned_and_refused_routes_append_nothing`,
 `requests_attribute_all_project_and_secondary_binding_rows_to_the_bound_principal`,
 `request_keys_cache_original_reply_across_restart_and_reject_cross_op_reuse`,
-`move_apis_do_not_append_journal_rows`,
-`self_author_conflict_never_overwrites_identity_and_cache_never_journals`.
+`move_apis_do_not_append_journal_rows`.
 
 ## 3. Tables
 
 **Shared and derived.** Sent through the identity log when it is enabled
-([identity-log-contract.md](identity-log-contract.md)), and rebuilt from the
+([hub-log-contract.md](hub-log-contract.md)), and rebuilt from the
 journal:
 
 | Table | Holds |
 |---|---|
 | `workspace` | Workspace ids, names and timestamps. |
+| `workspace_document` | Shared workspace documents. |
 | `project` | Project ids, names, and whether a project is implicit. |
 | `project_workspace` | Which workspace each project is placed in. |
 | `project_alias` | Old project ids that resolve to a current one. Aliases of implicit ids are not shared. |
 | `project_root_key` | Machine-neutral root keys (`remote` as `owner/repo`, or `label`) per project. |
+| `placement_state`, `placement_fact` | Shared placement state and facts. |
 | `agent` | Agent identity: name, tag, labels, role, placement, avatar, GitHub identity, supervisor, and retirement or merge. |
 | `agent_name_claim` | Active and released name claims, one active claim per agent and per name in a namespace. |
-| `member_name` | Display names of the machines in the identity log, keyed by author. |
+| `member_name`, `member_box` | Machine display names and box ids, keyed by author. |
 | `catalog_pin_set`, `catalog_pin` | An agent's shared package pins, root ranges and canonical pin digest. `catalog.pin` is never an identity-feed op. |
 | `user_profile`, `user_expertise` | The optional fleet-wide user fields and workspace/project expertise. Changes use `user.set`, never the agent or project history feeds. Scope deletion cascades to expertise in the same transaction. |
 
@@ -105,10 +107,11 @@ journal:
 | Table | Holds |
 |---|---|
 | `identity_log_state` | Log state, applied position, last seen head, and a saved enable plan. |
-| `pending_entry` | Shared writes whose outcome is not settled. |
+| `pending_entry` | Retained historical pending rows, counted by `identity_log.status`. The hub writer does not use this table. |
+| `hub_attempt`, `hub_attempt_send`, `hub_local_reply` | Hub write attempts, durable send bodies and stored local replies. |
+| `hub_held_epoch`, `role_gen_high_water` | Held fleet epochs and the role-generation floor used by the lease service. |
 | `session_binding` | Session reference to host session bindings. |
-| `claim_cache`, `role_cache` | Cached agent and role claims from engram. A null holder means the record was absent. |
-| `role_take_request` | Each approved role take, so a retry resends the same bytes. |
+| `role_cache` | Local role enrollment for reads without a selected hub. It does not establish role possession. |
 | `user_request` | Original user.set bodies and replies, including no-ops; request-key reuse is checked locally and receipts survive rebuild. |
 | `self_identity` | This machine's own author pseudonym, once learned. |
 | `agent_move`, `move_setting` | Move checkpoints and the lid-close setting. |
@@ -119,7 +122,7 @@ journal:
 | `catalog_plan`, `catalog_generation`, `catalog_transition` | Local catalog preparation, activation and transition receipts (each applied plan or generation transition's argument digest and original result, so a repeat returns the same result); never journaled or exported. |
 
 Tests: `consent_state_is_local_persistent_and_not_rebuilt_or_exported`,
-`remote_cascades_retire_bindings_move_keys_and_clear_workspace_paths`.
+`hub_remote_project_removal_cascades_and_retires_bindings`.
 
 ## 4. Verify and rebuild
 
@@ -152,7 +155,7 @@ before the module was named entorhinal; changing it would re-run migration 1).
 | 5 | The journal's `principal` column. |
 | 6 | Owned-remote overrides. |
 | 7 | The identity log: journal stream and entry columns, `identity_log_state`, `pending_entry`, root keys, and `workspace_root` (root paths move out of `workspace`). |
-| 8 | Session bindings, claim and role caches, role takes, self identity, member names. |
+| 8 | Session bindings, self identity, and member names, among other historical changes. |
 | 9 | Move checkpoints and the lid-close setting; session bindings may lack a session key. |
 | 10 | Consent state, the audit and hire caps. |
 | 11 | Catalog registry trust, held status, publisher grants and audit. |
