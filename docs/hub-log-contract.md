@@ -84,8 +84,11 @@ identity and digest and installs only a complete snapshot. The initial
 residence and role records must also be verified. A retry uses the saved plan
 and settles the existing parts rather than starting a different snapshot.
 The [snapshot vector](../test-vectors/hub-snapshot-v1/README.md) pins the part
-format and entry id. Existing hub snapshots may have a nonzero `engram_through`
-base; the snapshot ends at that base plus the number of parts.
+format and entry id. `engram_through` is the log position the snapshot starts
+from: 0 for a new account, but nonzero in snapshots written when an account
+moved its earlier engram-hosted log to the hub, where it is the last engram
+position the snapshot already contains. The snapshot ends at that base plus the
+number of parts.
 
 Tests: `hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins`,
 `hub_catch_up_resumes_saved_enable_and_joins_disabled_store_then_applies_tail`.

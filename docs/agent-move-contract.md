@@ -390,8 +390,9 @@ session container derived from the agent ID and cut ID, so a later move cannot
 reuse a container fenced by an earlier handoff. Prepare durably saves the
 snapshot, admits it, and checks cloud coverage; export confirms coverage before
 the driver seals the cut. Lease and offline errors are retryable participant
-refusals. Lost admits are reconciled by
-checking the already admitted prefix, not by duplicating bytes.
+refusals. If the reply to a `session.admit` call (which hands a chunk of the
+stream to the session door) is lost, the participant asks the door how much it
+already holds and resends only the rest, never duplicating bytes.
 
 The opaque stream format is `package-closure/v1`: ASCII
 `ck-package-closure/v1\n`, a big-endian u32 blob count, then ascending unique

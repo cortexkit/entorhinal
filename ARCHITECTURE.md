@@ -69,7 +69,7 @@ Package files live outside SQLite, in a content-addressed folder beside the stor
 
 ## How a request runs
 
-**Startup.** The daemon starts the module with `--subc <connection file>`. In HELLO_ACK it supplies the storage descriptor and this machine's id. The module opens the store, retrying while an exiting predecessor still holds the lease, checks that the store was made on this machine (see the foreign-store rule), and starts its background tasks. While storage is not ready, requests that need it refuse `store_unavailable`; a store still sharing the old way reports `legacy_sharing_unsupported` instead.
+**Startup.** The daemon starts the module with `--subc <connection file>`. In HELLO_ACK it supplies the storage descriptor and this machine's id. The module opens the store, retrying while an exiting predecessor still holds the lease, checks that the store was made on this machine (rule 7 under "Rules that bite"), and starts its background tasks. While storage is not ready, requests that need it refuse `store_unavailable`; a store still sharing the old way reports `legacy_sharing_unsupported` instead.
 
 **Admission.** Every route's principal, scope stamp and flow come from the daemon at bind, never from the request. Each operation then passes its own rules in `ProjectsHandler::admit_with` (`main.rs`):
 
