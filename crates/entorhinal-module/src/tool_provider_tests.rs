@@ -373,6 +373,68 @@ async fn retired_and_unknown_callers_are_refused_on_previously_bound_routes() {
 }
 
 #[tokio::test]
+async fn agent_tools_enforce_confirmed_hub_residence_even_with_standing_grants() {
+    use entorhinal_core::agent::consent::{GrantClass, StandingGrant};
+
+    let f = Fixture::new();
+    let store = f.handler.with_store(|store| Ok(store.clone())).unwrap();
+    let id = &f.agents[2];
+    f.admit(Some(&f.stamp(2)));
+    let sharing_off = store.agent_where(id).unwrap();
+    assert_eq!(sharing_off.status, "unclaimed");
+    assert!(sharing_off.known && !sharing_off.stale);
+    f.admitted("agents_list_hires", json!({})).await;
+
+    store
+        .consent_transaction(|tx| {
+            tx.put_grant(&StandingGrant {
+                id: "standing".into(),
+                holder_agent_id: id.clone(),
+                class: GrantClass::Hire,
+                scope_id: "P".into(),
+                granted_at_ms: 100,
+                card_ref: "card".into(),
+                revoked_at_ms: None,
+            })
+        })
+        .unwrap();
+    let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    crate::hub_residence::install_observed_claim(&f.handler, id, other);
+    let residence = f.handler.residence().unwrap();
+    let locate = || residence.with_context(|context| store.hub_agent_where(id, context));
+    let elsewhere = locate().unwrap();
+    assert_eq!(elsewhere.status, "held_elsewhere");
+    assert_eq!(elsewhere.holder.as_deref(), Some(other));
+    assert_eq!(elsewhere.epoch, 1);
+    assert!(elsewhere.known && !elsewhere.stale);
+    f.refusal("agents_hire", arguments("agents_hire"), "held_elsewhere")
+        .await;
+    f.refusal("catalog_prepare", Value::Null, "held_elsewhere")
+        .await;
+
+    let key = format!("residence.{id}");
+    assert!(store.record_hub_kv(&key, 2, None, 200).unwrap());
+    assert_eq!(locate().unwrap_err().code, "claim_integrity_failed");
+    f.refusal("agents_hire", Value::Null, "claim_integrity_failed")
+        .await;
+
+    // Leave the residence watch at revision 1 so it has not yet confirmed
+    // the newer cache entries, as can happen while starting up.
+    let own = residence.with_context(|context| context.local_box.to_owned());
+    for (revision, holder, status) in [(3, own.as_str(), "held_here"), (4, other, "held_elsewhere")]
+    {
+        let body = json!({"holder":holder,"holder_ep":0,"gen":revision,"cut_id":"cut"});
+        assert!(store
+            .record_hub_kv(&key, revision, Some((b"observed claim", Some(&body))), 300)
+            .unwrap());
+        let stale = locate().unwrap();
+        assert_eq!(stale.status, status);
+        assert!(stale.known && stale.stale);
+        f.admitted("agents_list_hires", json!({})).await;
+    }
+}
+
+#[tokio::test]
 async fn every_write_validates_printable_ascii_request_keys_before_other_arguments() {
     let f = Fixture::new();
     let mut invalid = vec![
