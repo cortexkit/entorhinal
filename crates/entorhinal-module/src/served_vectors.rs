@@ -24,6 +24,7 @@ use crate::{
 
 #[path = "watch_tests.rs"]
 mod watch_tests;
+pub(crate) use watch_tests::record as published_watch_record;
 
 #[path = "bus_changes_tests.rs"]
 mod bus_changes_tests;
@@ -333,6 +334,10 @@ fn agent_identity_vector(directory: &str, name: &str) -> bool {
             "where.json"
                 | "where-hub.json"
                 | "where-many-hub.json"
+                | "where-many-hub-mixed.json"
+                | "where-many-hub-startup.json"
+                | "where-moving-hub-source.json"
+                | "where-moving-hub-receiver.json"
                 | "where-sharing-off.json"
                 | "session-for-ref.json"
                 | "session-for-runner.json"
@@ -507,6 +512,10 @@ fn agent_identity_published_records_roundtrip_exactly() {
         ("agent-sessions-v1", "where.json"),
         ("agent-sessions-v1", "where-hub.json"),
         ("agent-sessions-v1", "where-many-hub.json"),
+        ("agent-sessions-v1", "where-many-hub-mixed.json"),
+        ("agent-sessions-v1", "where-many-hub-startup.json"),
+        ("agent-sessions-v1", "where-moving-hub-source.json"),
+        ("agent-sessions-v1", "where-moving-hub-receiver.json"),
         ("agent-sessions-v1", "where-sharing-off.json"),
         ("agent-sessions-v1", "session-for-ref.json"),
         ("agent-sessions-v1", "session-for-runner.json"),

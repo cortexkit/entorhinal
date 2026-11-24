@@ -106,6 +106,7 @@ pub(super) struct Runtime {
     clock: fn() -> i64,
     role_leases: Arc<role_leases::Leases>,
     move_wake: Arc<crate::move_driver::MoveWake>,
+    watches: Weak<crate::watches::Watches>,
 }
 
 #[async_trait]
@@ -264,6 +265,7 @@ pub(super) struct Residence {
     role_leases: Weak<role_leases::Leases>,
     link: Notify,
     move_wake: Weak<crate::move_driver::MoveWake>,
+    watches: Weak<crate::watches::Watches>,
 }
 
 pub(super) struct Running {
@@ -316,6 +318,7 @@ impl ProjectsHandler {
             clock: self.clock,
             role_leases: self.role_leases.clone(),
             move_wake: self.move_wake.clone(),
+            watches: Arc::downgrade(&self.watches),
         }
     }
 }
@@ -354,6 +357,7 @@ impl Runtime {
             role_leases: Arc::downgrade(&self.role_leases),
             link: Notify::new(),
             move_wake: Arc::downgrade(&self.move_wake),
+            watches: self.watches.clone(),
         });
         *running = Some(Running {
             watch: tokio::spawn(service.clone().watch(feed)),
@@ -610,6 +614,7 @@ impl Residence {
         let committed = self.commits.notified();
         tokio::pin!(committed);
         committed.as_mut().enable();
+        let mut ready = false;
         loop {
             if !self.sql.available() {
                 return;
@@ -618,10 +623,12 @@ impl Residence {
                 .values()
                 .filter_map(|entry| entry.lease_retry_at)
                 .min();
+            let mut where_changed = false;
             tokio::select! {
                 event = feed.next_event() => match event {
                     FeedEvent::BucketReset => {
                         self.reset_role_watch();
+                        self.resync_where();
                         return;
                     }
                     FeedEvent::Connected | FeedEvent::Disconnected => {
@@ -634,28 +641,32 @@ impl Residence {
                             let arrival_head = pending.remove(&entry.key)
                                 .filter(|old| old.entry.revision == entry.revision)
                                 .and_then(|old| old.arrival_head);
-                            self.observe_or_hold(HeldDelivery { entry, arrival_head, waiting_for_anchor: false, lease_retry_at: None }, &mut pending).await;
+                            where_changed = self.observe_or_hold(HeldDelivery { entry, arrival_head, waiting_for_anchor: false, lease_retry_at: None }, &mut pending).await;
                         }
                     }
                 },
                 Ok(()) = anchors.changed() => {
+                    // A roster change can change whether a remote holder has a verified box ID.
+                    where_changed = ready;
                     let waiting: Vec<_> = pending.extract_if(|_, entry| entry.waiting_for_anchor).collect();
                     for (_, entry) in waiting {
-                        self.observe_or_hold(entry, &mut pending).await;
+                        where_changed |= self.observe_or_hold(entry, &mut pending).await;
                     }
                 }
                 _ = retry.tick(), if pending.values().any(|entry| !entry.waiting_for_anchor && entry.lease_retry_at.is_none()) => {
                     let retrying: Vec<_> = pending.extract_if(|_, entry| !entry.waiting_for_anchor && entry.lease_retry_at.is_none()).collect();
                     for (_, entry) in retrying {
-                        self.observe_or_hold(entry, &mut pending).await;
+                        where_changed |= self.observe_or_hold(entry, &mut pending).await;
                     }
                 }
-                _ = &mut committed, if lease_retry.is_some() => {
+                _ = &mut committed => {
+                    // The log also signals when membership finishes catching up, even if
+                    // the residence feed is already idle after its own catch-up.
                     committed.set(self.commits.notified());
                     committed.as_mut().enable();
                     let roles: Vec<_> = pending.extract_if(|_, entry| entry.lease_retry_at.is_some()).collect();
                     for (_, entry) in roles {
-                        self.observe_or_hold(entry, &mut pending).await;
+                        where_changed |= self.observe_or_hold(entry, &mut pending).await;
                     }
                 }
                 _ = async {
@@ -666,10 +677,21 @@ impl Residence {
                     let now = self.role_clock_ms();
                     let roles: Vec<_> = pending.extract_if(|_, entry| entry.lease_retry_at.is_some_and(|at| at <= now)).collect();
                     for (_, entry) in roles {
-                        self.observe_or_hold(entry, &mut pending).await;
+                        where_changed |= self.observe_or_hold(entry, &mut pending).await;
                     }
                 }
             }
+            let next_ready = self.ready();
+            if where_changed || next_ready != ready {
+                self.resync_where();
+            }
+            ready = next_ready;
+        }
+    }
+
+    fn resync_where(&self) {
+        if let Some(watches) = self.watches.upgrade() {
+            watches.resync_all();
         }
     }
 
@@ -677,8 +699,19 @@ impl Residence {
         &self,
         mut delivery: HeldDelivery,
         pending: &mut HashMap<String, HeldDelivery>,
-    ) {
+    ) -> bool {
         let key = delivery.entry.key.clone();
+        let revision = delivery.entry.revision;
+        let residence = key
+            .strip_prefix("residence.")
+            .is_some_and(entorhinal_core::agent::valid_agent_id);
+        let before = residence.then(|| {
+            let watched = self.watched.read().unwrap();
+            (
+                watched.revisions.get(&key).copied(),
+                watched.held.contains(&key),
+            )
+        });
         let deadline = Instant::now() + BUDGET;
         let mut result = self
             .observe_at(&delivery.entry, &mut delivery.arrival_head, deadline)
@@ -723,6 +756,7 @@ impl Residence {
             }
         }
         let mut watched = self.watched.write().unwrap();
+        let settled = result.is_ok();
         if let Err(error) = result {
             // Losing the log or vault is not evidence that the value is bad.
             // Fence only the affected key and keep consuming the watch.
@@ -745,6 +779,13 @@ impl Residence {
                 }
             }
         }
+        // A new put, delete or integrity refusal can change the answer. A
+        // held revision can also change whether the cached answer is stale.
+        let where_changed = before.is_some_and(|(old_revision, was_held)| {
+            (settled && old_revision.is_none_or(|old| old < revision))
+                || old_revision != watched.revisions.get(&key).copied()
+                || was_held != watched.held.contains(&key)
+        });
         drop(watched);
         // Notify only the affected role. Renewal events must not wake every
         // candidate on the machine.
@@ -754,6 +795,7 @@ impl Residence {
                 wake.hub_changed();
             }
         }
+        where_changed
     }
 
     #[cfg(test)]

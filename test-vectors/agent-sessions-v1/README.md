@@ -28,7 +28,8 @@ sample uses opaque fixed references for its new keys; entorhinal does not
 compute references from the project root or interpret their contents.
 
 The whereabouts samples no longer include replies that came only from
-the legacy agent claim cache. Consumers pinning `where.json` must re-pin.
+the legacy agent claim cache. Hub samples use the live hub test rig; use
+the files below for confirmed holders, hub startup, and in-progress moves.
 
 ## Params schemas
 
@@ -65,13 +66,10 @@ objects deny unknown fields; a field outside the listed schema is an
   `null`. Historical bindings without a runner remain readable; every new
   registration, including re-registration, must name a runner.
 - `agent.where`: exactly `{agent_id}`, where the string has entorhinal's form
-  `agent_` followed by 8 or 16 lowercase hexadecimal digits. The file includes
-  an agent never previously read from the claim cache
-  (`unclaimed`), `held_here`, `held_elsewhere` with the holder name `Other machine`,
-  and `unknown_agent`.
-- Both moving samples keep top-level `status` at `held_here`; the presence of
-  `moving` for a non-terminal move on this machine is the signal, and its `side`
-  identifies which end this machine is.
+  `agent_` followed by 8 or 16 lowercase hexadecimal digits. `where.json`
+  covers `unclaimed` before hub residence is selected and `unknown_agent`;
+  `where-sharing-off.json` covers confirmed `unclaimed` with sharing off.
+  The hub files below cover remote holders and non-terminal moves.
 - `agent.register_session` requires `runner`: the module ID
   of the llm-runner hosting the session, 1–64 bytes with no control
   characters. It is taken out before the strict decode above, so the
@@ -123,8 +121,8 @@ objects deny unknown fields; a field outside the listed schema is an
   (`unknown` with no history), and `network_history`, every
   `{network, since_ms}` oldest first (empty with no history).
 - `agent.where_many`: exactly `{agentIds}`, with 1–64 unique valid agent IDs.
-  Results preserve request order and omit unknown agents; the sample requests a
-  locally held and remotely held agent around an unknown ID.
+  Results preserve request order and omit unknown agents. The hub files below
+  cover confirmed and startup replies.
 
 Moved finished sessions retain metadata on the receiving machine while their data
 stays on the source (or its recorded earlier holder). The three session reads
@@ -167,6 +165,26 @@ a backfill makes the data local.
 - **`where-sharing-off.json`**: on a machine that has never turned sharing on, an
   agent with no claim is a verified `unclaimed` (`known: true`), because no
   other machine can hold it.
+- **`where-hub.json`**: two `held_elsewhere` replies, one with a daemon ID in
+  `holder_box` and one with only an identity-log member key in `holder`.
+- **`where-many-hub.json`**: the same two remote agents in one batch.
+- **`where-many-hub-mixed.json`**: one batch requests a confirmed local holder,
+  a confirmed remote holder with `holder_box` and a display name in
+  `holder_name`, then an unknown ID. Only the first two appear in the reply,
+  in request order.
+- **`where-many-hub-startup.json`**: two reads while membership loading is
+  parked after restart. Before residence is installed, the local agent is
+  `unclaimed` with `known: false`. Once residence knows its own box ID, the
+  same agent is `held_here`; the remote agent is `held_elsewhere` without
+  `holder_box`. All three rows have `stale: true`.
+- **`where-moving-hub-source.json`**: while the receiver has staged the move,
+  the source reports top-level `held_here` with `moving.side: "source"` and
+  `moving.step: "published"`.
+- **`where-moving-hub-receiver.json`**: at the same point, the receiver
+  reports top-level `held_elsewhere` with `moving.side: "receiver"` and
+  `moving.step: "staged"`. Both move records include `peer`, `peer_name`,
+  and `cut_id` in `moving`. The rig fixes the source worker's clock at `650`
+  and the reply clock at `700`; it does not rewrite any reply fields.
 - **`register-session-runner.json`**: a Broca worker registration naming
   runner `broca`; the reply bytes have the same shape as a registration
   without one.
@@ -268,7 +286,7 @@ a backfill makes the data local.
   `0123456789abcdef`; the complete canonical scratch root is mapped explicitly
   to `/fixture/head-project`, including in registration requests.
 - **`SHA256SUMS`**: SHA-256 hashes of every JSON vector file, with
-  names relative to this directory. The first ten lines are pinned by
+  names relative to this directory, verified by
   `served_vectors::agent_session_samples_keep_their_pinned_bytes_and_checksums`.
 - **`register-session-delegated.json`**: delegated registration and reply,
   captured from the real served handler with clock `700`.
@@ -332,6 +350,16 @@ ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors_sessions_watch_records_match_published_file -- --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_role_records_match_published_files -- --nocapture
 ```
+
+The live hub samples require `nats-server` on `PATH`. Regenerate the new
+hub location files and the hub location watch under `fleet-watch-v1` with:
+
+```sh
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked hub_residence_ -- --nocapture
+```
+
+Without the write flag, these live tests compare the captured bytes with the
+published files.
 
 Refresh their hashes from the repository root with:
 

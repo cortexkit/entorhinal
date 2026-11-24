@@ -4,12 +4,16 @@ use crate::{
     fleet_record::{self, Header},
     hub_membership,
     hub_residence::{self, SnapshotClaims},
+    served_vectors::published_file,
     RouteAdmission, RouteKey,
 };
 use std::{collections::HashMap, sync::atomic::AtomicUsize};
+use subc_client_rs::test_support::{BindIdentity, Frame, FrameType, ModuleHarness, RouteTarget};
+use subc_client_rs::{BindDecision, ModuleHandler, RequestCtx, RouteBindRequest, RouteHandle};
 
 const ROUTE: RouteKey = (20, 1);
 const MIGRATED: &str = "agent_0000000000000040";
+const OTHER: &str = "agent_0000000000000041";
 
 #[derive(Default)]
 struct Image(HashMap<String, (Option<String>, i64)>);
@@ -50,19 +54,18 @@ async fn hub_cutover_holder_samples() {
     let handler = &mut rig.b.handler;
     handler.operator_confirmer = Arc::new(RoleConfirm::default());
     bind(handler, subc_protocol::Principal::Direct);
-    let other = "agent_0000000000000041";
     migrate_identity(&rig.b, MIGRATED, "Engram held");
-    migrate_identity(&rig.b, other, "Hub held");
+    migrate_identity(&rig.b, OTHER, "Hub held");
     let image = Arc::new(Image(HashMap::from([
         (MIGRATED.into(), (Some(SAMPLE_SENTINEL.into()), 5)),
-        (other.into(), (Some(A.into()), 1)),
+        (OTHER.into(), (Some(A.into()), 1)),
         (
             "role.dreamer.workspace_02".into(),
             (Some(SAMPLE_SENTINEL.into()), 5),
         ),
     ])));
     residence(&rig.b, image);
-    for (id, holder, gen) in [(MIGRATED, SAMPLE_SENTINEL, 5), (other, A, 1)] {
+    for (id, holder, gen) in [(MIGRATED, SAMPLE_SENTINEL, 5), (OTHER, A, 1)] {
         let mut seeded = record(B, holder, gen, false);
         seeded["seeded"] = json!(true);
         let revision = put(&rig, id, 0, B, seeded).await;
@@ -70,8 +73,7 @@ async fn hub_cutover_holder_samples() {
         until(|| ready_for(&rig.b, id)).await;
     }
     let handler = &rig.b.handler;
-    use crate::served_vectors::published_file;
-    let location = [other, MIGRATED];
+    let location = [OTHER, MIGRATED];
     let mut records = Vec::new();
     for id in location {
         records.push(cutover_sample(handler, "agent.where", json!({"agent_id":id})).await);
@@ -139,8 +141,198 @@ async fn hub_cutover_holder_samples() {
     published_file("role-claims-v1", "handback-requested.json", vec![cutover_sample(handler, "role.take", json!({"role":role,"expected_epoch":1,"request_id":"23".repeat(16),"reason":"switch computers"})).await]);
 }
 
+fn record_display_name(node: &Node, author: &str, box_id: &str, name: &str) {
+    store_of(&node.handler)
+        .apply_entry("member.set_name", "{}", "test", None, |tx| {
+            tx.execute("INSERT INTO member_box VALUES(?1,?2)", [author, box_id])?;
+            tx.execute("INSERT INTO member_name VALUES(?1,?2)", [author, name])?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn hub_residence_where_many_mixed_sample() {
+    let Some(rig) = IdentityRig::new().await else {
+        return;
+    };
+    let node = &rig.b;
+    bind(&node.handler, subc_protocol::Principal::Direct);
+    migrate_identity(node, MIGRATED, "Local agent");
+    migrate_identity(node, OTHER, "Remote agent");
+    // Use a different author so a name keyed only by author cannot match the box ID.
+    record_display_name(node, &"a5".repeat(16), A, "Workshop machine");
+    residence(
+        node,
+        Arc::new(Image(HashMap::from([
+            (MIGRATED.into(), (Some(B.into()), 1)),
+            (OTHER.into(), (Some(A.into()), 1)),
+        ]))),
+    );
+    for (id, holder) in [(MIGRATED, B), (OTHER, A)] {
+        let mut seeded = record(B, holder, 1, false);
+        seeded["seeded"] = json!(true);
+        let revision = put(&rig, id, 0, B, seeded).await;
+        assert!(!applied(node, id, revision).await.integrity_failed);
+        until(|| ready_for(node, id)).await;
+    }
+    let sample = cutover_sample(
+        &node.handler,
+        "agent.where_many",
+        json!({"agentIds": [MIGRATED, OTHER, "agent_ffffffffffffffff"]}),
+    )
+    .await;
+    let parsed: Value = serde_json::from_str(&sample).unwrap();
+    let rows = parsed["reply"]["result"]["agents"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["agent_id"], MIGRATED);
+    assert_eq!(rows[0]["status"], "held_here");
+    assert_eq!(rows[0]["stale"], false);
+    assert_eq!(rows[1]["agent_id"], OTHER);
+    assert_eq!(rows[1]["status"], "held_elsewhere");
+    assert_eq!(rows[1]["stale"], false);
+    assert_eq!(rows[1]["holder_box"], A);
+    assert_eq!(rows[1]["holder_name"], "Workshop machine");
+    published_file(
+        "agent-sessions-v1",
+        "where-many-hub-mixed.json",
+        vec![sample],
+    );
+}
+
+// The live rig has already opened the store; the harness's HELLO_ACK has no descriptor.
+struct OpenStore(crate::ServedHandler);
+
+#[async_trait::async_trait]
+impl ModuleHandler for OpenStore {
+    async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        self.0.handle(ctx, body).await
+    }
+
+    async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
+        self.0.on_bind(request).await
+    }
+
+    async fn on_route_gone(&self, handle: &RouteHandle) {
+        self.0.on_route_gone(handle).await;
+    }
+}
+
+struct WhereWatch {
+    module: ModuleHarness,
+    handler: Arc<ProjectsHandler>,
+    corr: u64,
+}
+
+impl WhereWatch {
+    async fn open(handler: ProjectsHandler) -> Self {
+        let served = handler.into_served();
+        let handler = served.0.clone();
+        let mut module = ModuleHarness::start(move |_| OpenStore(served), []).await;
+        let route = module
+            .bind_route(
+                RouteBindRequest::new(
+                    RouteHandle::detached(1817, 1),
+                    RouteTarget::ManagementSurface {
+                        module_id: crate::MODULE_ID.into(),
+                    },
+                    BindIdentity::new("test", "phone"),
+                )
+                .with_principal(crate::tests::reserved("callosum")),
+            )
+            .await;
+        let corr = module
+            .send_request(route, body(crate::watches::WHERE, json!({})))
+            .await;
+        Self {
+            module,
+            handler,
+            corr,
+        }
+    }
+
+    async fn resync(&mut self) -> Frame {
+        let frame = tokio::time::timeout(Duration::from_secs(5), self.module.next_frame())
+            .await
+            .expect("no whereabouts resync")
+            .expect("watch transport closed");
+        assert_eq!(frame.header.corr, self.corr);
+        assert_eq!(frame.header.ty, FrameType::StreamData);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&frame.body).unwrap()["kind"],
+            "resync"
+        );
+        frame
+    }
+}
+
+#[tokio::test]
+async fn hub_residence_where_watch_resyncs_on_hub_claim_sample() {
+    let Some(rig) = IdentityRig::new().await else {
+        return;
+    };
+    migrate_identity(&rig.b, MIGRATED, "Moving between holders");
+    residence(
+        &rig.b,
+        Arc::new(Image(HashMap::from([(
+            MIGRATED.into(),
+            (Some(A.into()), 1),
+        )]))),
+    );
+    let mut seeded = record(A, A, 1, false);
+    seeded["seeded"] = json!(true);
+    let revision = put(&rig, MIGRATED, 0, A, seeded).await;
+    assert!(!applied(&rig.b, MIGRATED, revision).await.integrity_failed);
+    until(|| ready_for(&rig.b, MIGRATED)).await;
+    let mut watch = WhereWatch::open(rig.b.handler).await;
+    let opening = watch.resync().await;
+    let initial = result(where_(&watch.handler, MIGRATED));
+    assert_eq!(initial["status"], "held_elsewhere");
+    assert_eq!(initial["holder_box"], A);
+    assert_eq!(initial["stale"], false);
+
+    // Only the hub KV record changes: no identity or local move write can wake the watch.
+    let key = format!("residence.{MIGRATED}");
+    let claim = fleet_record::prepare(
+        &ClaustrumCredentialResolver::with_target(rig.keys.clone(), 0),
+        rig.keys.as_ref(),
+        &Header {
+            kind: "residence".into(),
+            key: key.clone(),
+            writer: A.into(),
+            writer_ep: 0,
+            entry_id: "ab".repeat(16),
+        },
+        &record(A, B, 2, false),
+    )
+    .await
+    .unwrap();
+    rig.kv
+        .update(key, claim.into_bytes().into(), revision)
+        .await
+        .unwrap();
+
+    until(|| result(where_(&watch.handler, MIGRATED))["status"] == "held_here").await;
+    let changed = watch.resync().await;
+    let reply = result(where_(&watch.handler, MIGRATED));
+    assert_eq!(reply["status"], "held_here");
+    assert_eq!(reply["holder_box"], B);
+    assert_eq!(reply["stale"], false);
+    watch.module.shutdown().await;
+    published_file(
+        "fleet-watch-v1",
+        "where-watch-hub.json",
+        vec![crate::served_vectors::published_watch_record(
+            crate::watches::WHERE,
+            json!({}),
+            &[opening, changed],
+        )],
+    );
+}
+
 #[derive(Default)]
 struct Confirm(AtomicUsize);
+
 #[async_trait::async_trait]
 impl OperatorConfirmer for Confirm {
     async fn confirm_operator(
@@ -666,16 +858,19 @@ async fn hub_residence_where_many_keeps_own_holder_during_restart() {
         return;
     };
     migrate_identity(&rig.a, MIGRATED, "Local agent");
-    let image = Arc::new(Image(HashMap::from([(
-        MIGRATED.into(),
-        (Some(A.into()), 1),
-    )])));
+    migrate_identity(&rig.a, OTHER, "Remote agent");
+    let image = Arc::new(Image(HashMap::from([
+        (MIGRATED.into(), (Some(A.into()), 1)),
+        (OTHER.into(), (Some(B.into()), 1)),
+    ])));
     residence(&rig.a, image.clone());
-    let mut seeded = record(A, A, 1, false);
-    seeded["seeded"] = json!(true);
-    let revision = put(&rig, MIGRATED, 0, A, seeded).await;
-    assert!(!applied(&rig.a, MIGRATED, revision).await.integrity_failed);
-    until(|| ready_for(&rig.a, MIGRATED)).await;
+    for (id, holder) in [(MIGRATED, A), (OTHER, B)] {
+        let mut seeded = record(A, holder, 1, false);
+        seeded["seeded"] = json!(true);
+        let revision = put(&rig, id, 0, A, seeded).await;
+        assert!(!applied(&rig.a, id, revision).await.integrity_failed);
+        until(|| ready_for(&rig.a, id)).await;
+    }
 
     let Node { handler, leaf, log } = rig.a;
     handler.stop_hub_residence().await;
@@ -685,7 +880,7 @@ async fn hub_residence_where_many_keeps_own_holder_during_restart() {
     let (entered, waiting) = oneshot::channel();
     let (release, released) = oneshot::channel();
     *leaf.head_gate.lock().unwrap() = Some((entered, released));
-    let mut restarted = ProjectsHandler::with_runtime(A.into(), || 800);
+    let mut restarted = ProjectsHandler::with_runtime(A.into(), || 700);
     restarted.feed_clock = Arc::new(FrozenFeedClock);
     *restarted.store.lock().unwrap() = Some(store(&rig._processes, "box-a"));
     let node = Node {
@@ -694,26 +889,59 @@ async fn hub_residence_where_many_keeps_own_holder_during_restart() {
         handler: restarted,
     };
     within(waiting).await.unwrap();
-    residence(&node, image);
     bind(&node.handler, subc_protocol::Principal::Direct);
-    let reply = result(
-        node.handler
-            .handle_served_request(
-                &body("agent.where_many", json!({"agentIds":[MIGRATED]})),
-                ROUTE,
-            )
-            .await,
-    );
+    // Without residence installed, the handler cannot compare the cached holder to its box ID.
+    let before_residence = cutover_sample(
+        &node.handler,
+        "agent.where_many",
+        json!({"agentIds":[MIGRATED]}),
+    )
+    .await;
+    let reply: Value = serde_json::from_str(&before_residence).unwrap();
+    let entry = &reply["reply"]["result"]["agents"][0];
+    assert_eq!(entry["status"], "unclaimed");
+    assert_eq!(entry["known"], false);
+    assert_eq!(entry["stale"], true);
+
+    residence(&node, image);
+    let before_membership = cutover_sample(
+        &node.handler,
+        "agent.where_many",
+        json!({"agentIds":[MIGRATED,OTHER]}),
+    )
+    .await;
     assert!(!node.log.membership_ready());
-    let entry = &reply["agents"][0];
+    let reply: Value = serde_json::from_str(&before_membership).unwrap();
+    let entries = &reply["reply"]["result"]["agents"];
+    let entry = &entries[0];
     assert_eq!(entry["agent_id"], MIGRATED);
     assert_eq!(entry["status"], "held_here");
     assert_eq!(entry["known"], true);
     assert_eq!(entry["epoch"], 1);
     assert_eq!(entry["holder_box"], A);
     assert_eq!(entry["stale"], true);
+    let remote = &entries[1];
+    assert_eq!(remote["agent_id"], OTHER);
+    assert_eq!(remote["status"], "held_elsewhere");
+    assert_eq!(remote["holder"], B);
+    assert_eq!(remote["stale"], true);
+    assert!(remote.get("holder_box").is_none());
+    // Finish KV replay before opening the watch so only membership catch-up can wake it.
+    let residence = node.handler.residence().unwrap();
+    until(|| residence.kv_watch_caught_up()).await;
+    assert!(!node.log.membership_ready());
+    let mut watch = WhereWatch::open(node.handler).await;
+    watch.resync().await;
     release.send(()).unwrap();
-    until(|| ready_for(&node, MIGRATED)).await;
+    until(|| result(where_(&watch.handler, MIGRATED))["stale"] == false).await;
+    watch.resync().await;
+    assert_eq!(result(where_(&watch.handler, MIGRATED))["stale"], false);
+    watch.module.shutdown().await;
+    published_file(
+        "agent-sessions-v1",
+        "where-many-hub-startup.json",
+        vec![before_residence, before_membership],
+    );
 }
 
 #[tokio::test]
@@ -1201,27 +1429,6 @@ async fn lease_handback_role_take_preference_steers_a_vacant_role() {
 #[tokio::test]
 async fn served_role_lease_v1_hub_first_take_matches_published_file() {
     use crate::role_leases::{monotonic_ms, tests::lease_sample_record, ACK, WATCH};
-    use crate::{BindDecision, ModuleHandler, RequestCtx, RouteBindRequest, RouteHandle};
-    use subc_client_rs::test_support::{BindIdentity, FrameType, ModuleHarness, RouteTarget};
-
-    // The live rig has already opened the store. The in-process harness's
-    // HELLO_ACK does not supply a storage descriptor.
-    struct OpenStore(crate::ServedHandler);
-
-    #[async_trait::async_trait]
-    impl ModuleHandler for OpenStore {
-        async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
-            self.0.handle(ctx, body).await
-        }
-
-        async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
-            self.0.on_bind(request).await
-        }
-
-        async fn on_route_gone(&self, handle: &RouteHandle) {
-            self.0.on_route_gone(handle).await;
-        }
-    }
 
     let Some(rig) = IdentityRig::new().await else {
         return;

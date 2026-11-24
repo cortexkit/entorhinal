@@ -869,7 +869,7 @@ impl Served {
     }
 }
 
-fn record(method: &str, params: Value, frames: &[Frame]) -> String {
+pub(crate) fn record(method: &str, params: Value, frames: &[Frame]) -> String {
     let frames = frames
         .iter()
         .map(|frame| {

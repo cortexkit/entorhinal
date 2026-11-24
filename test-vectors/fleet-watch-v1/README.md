@@ -16,15 +16,23 @@ sends `{"method":op,"params":request}` in one ordinary SUBC Request.
   requests. The first has no frames, causally checked after the handler enters
   its wait. Updating the tag then yields the second observation's changes frame.
 - `where-resync.json`: a missing cursor requires a full whereabouts read.
+- `where-watch-hub.json`: one live hub subscription opens with the phone's
+  empty params object (no cursor). The handler accepts it and immediately sends
+  `resync`. A signed residence update from the other computer changes the
+  answering computer's read from `held_elsewhere` to `held_here`. The same
+  subscription sends a second `resync` with an advanced cursor. Both frame
+  bodies are captured byte for byte, without substitutions.
 - `watch-capacity.json`: the seventeenth watch, with eight identity watches and
   eight whereabouts watches already open, refuses with error code
   `watch_capacity` before starting.
-- `SHA256SUMS`: hashes of the five JSON files, relative to this directory.
+- `SHA256SUMS`: hashes of the six JSON files, relative to this directory.
 
-The incarnation is fixed to `0123456789abcdef`. Identity tokens/generations and
-whereabouts seqs are local to one process on one machine; do not compare them between
-machines. Identity notices also carry the last applied shared `logPosition`. On
-`resync`, read `agent.fleet_identity` or `agent.where_many` and open a watch from
+The in-process fixture fixes the incarnation to `0123456789abcdef`; the live
+hub fixture uses a fixed value for the answering computer. Identity tokens,
+identity generations, and whereabouts sequence numbers are local to one
+process on one machine; do not compare them between machines. Identity notices
+also carry the last applied shared `logPosition`. On `resync`, read
+`agent.fleet_identity` or `agent.where_many` and open a watch from
 the new resume point. There is no full snapshot in a watch notice. A normal end,
 including route cancellation or module draining, is `StreamEnd`, never Response.
 
@@ -43,11 +51,13 @@ From the repository root:
 
 ```sh
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_fleet_watch_v1_records_match_published_files -- --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked hub_residence_where_watch_resyncs_on_hub_claim_sample -- --nocapture
 ```
 
-Without `ENTO_WRITE_SERVED_VECTORS`, that non-ignored test byte-compares the
-served records with these files. All subscription tests use a paused Tokio
-clock and causal readiness assertions rather than wall-clock delays.
+Without `ENTO_WRITE_SERVED_VECTORS`, the tests byte-compare the served records
+with these files. The in-process tests use a paused Tokio clock. The hub test
+requires `nats-server` on `PATH` and waits for the served frames and confirmed
+holder rather than using a fixed delay.
 
 Refresh hashes from the repository root:
 

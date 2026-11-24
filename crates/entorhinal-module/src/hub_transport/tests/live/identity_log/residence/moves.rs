@@ -264,6 +264,35 @@ impl Moving {
 }
 
 #[tokio::test]
+async fn hub_residence_moving_samples() {
+    let Some(mut f) = Moving::new().await else {
+        return;
+    };
+    f.source.clock = || 650;
+    f.stage().await;
+    for (node, side, author, peer, name) in [
+        (&f.rig.a, "source", "b5".repeat(16), B, "Studio"),
+        (&f.rig.b, "receiver", "a5".repeat(16), A, "Workshop"),
+    ] {
+        bind(&node.handler, subc_protocol::Principal::Direct);
+        record_display_name(node, &author, peer, name);
+        let sample =
+            cutover_sample(&node.handler, "agent.where", json!({"agent_id":MIGRATED})).await;
+        let reply: Value = serde_json::from_str(&sample).unwrap();
+        let moving = &reply["reply"]["result"]["moving"];
+        assert_eq!(moving["side"], side);
+        assert_eq!(moving["peer"], peer);
+        assert_eq!(moving["peer_name"], name);
+        assert_eq!(moving["cut_id"], CUT);
+        crate::served_vectors::published_file(
+            "agent-sessions-v1",
+            &format!("where-moving-hub-{side}.json"),
+            vec![sample],
+        );
+    }
+}
+
+#[tokio::test]
 async fn hub_move_restarts_through_the_full_handoff() {
     let Some(f) = Moving::new().await else {
         return;

@@ -7,6 +7,12 @@ use super::*;
 use crate::{fleet_record::Header, hub_write::tests::TestKeys};
 use async_nats::jetstream::kv::Entry;
 
+impl Residence {
+    pub(crate) fn kv_watch_caught_up(&self) -> bool {
+        self.watched.read().unwrap().initial
+    }
+}
+
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const ROLE_KEY: &str = "role.connector_home";
@@ -149,6 +155,7 @@ pub(crate) fn install_observed_claim(handler: &ProjectsHandler, agent: &str, hol
         role_leases: Arc::downgrade(&handler.role_leases),
         link: Notify::new(),
         move_wake: Arc::downgrade(&handler.move_wake),
+        watches: Arc::downgrade(&handler.watches),
     });
     assert!(service.ready());
     assert!(handler
@@ -204,6 +211,7 @@ impl Fixture {
             role_leases: Arc::downgrade(&leases),
             link: Notify::new(),
             move_wake: Weak::new(),
+            watches: Weak::new(),
         };
         Self {
             residence,

@@ -1,0 +1,4 @@
+[
+  {"op":"agent.where_many","request":{"agentIds":["agent_0000000000000040"]},"reply":{"result":{"agents":[{"agent_id":"agent_0000000000000040","cut_id":null,"epoch":0,"holder":null,"holder_name":null,"known":false,"read_at_ms":null,"stale":true,"status":"unclaimed"}]}}},
+  {"op":"agent.where_many","request":{"agentIds":["agent_0000000000000040","agent_0000000000000041"]},"reply":{"result":{"agents":[{"agent_id":"agent_0000000000000040","cut_id":null,"epoch":1,"holder":"0123456789abcdef0123456789abcdef","holder_box":"0123456789abcdef0123456789abcdef","holder_name":null,"known":true,"read_at_ms":700,"stale":true,"status":"held_here"},{"agent_id":"agent_0000000000000041","cut_id":null,"epoch":1,"holder":"fedcba9876543210fedcba9876543210","holder_name":null,"known":true,"read_at_ms":700,"stale":true,"status":"held_elsewhere"}]}}}
+]
