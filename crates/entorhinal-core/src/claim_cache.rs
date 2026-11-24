@@ -70,12 +70,19 @@ pub(crate) fn learn_self_author(
     Ok(true)
 }
 
+/// The display name of the machine `holder` names. Hub records name a machine
+/// by its box id, while names are recorded under the machine's identity-log
+/// author, so a box id is mapped to its author through `member_box` first.
 pub(crate) fn holder_name(
     conn: &Connection,
     holder: Option<&str>,
 ) -> rusqlite::Result<Option<String>> {
     conn.query_row(
-        "SELECT display_name FROM member_name WHERE author=?1",
+        "SELECT display_name FROM member_name WHERE author=?1
+         UNION ALL
+         SELECT n.display_name FROM member_box b JOIN member_name n ON n.author=b.author
+          WHERE b.box_id=?1
+         LIMIT 1",
         [holder],
         |row| row.get(0),
     )
@@ -472,6 +479,40 @@ mod tests {
             serde_json::json!({"known":true,"status":"held_elsewhere","holder":OTHER,"holder_name":null,
                 "epoch":1,"cut_id":"cut","read_at_ms":9,"stale":true})
         );
+    }
+
+    /// Hub records name the holder by box id; its display name is recorded under
+    /// the machine's author, so the reply must find it through `member_box`.
+    #[test]
+    fn hub_where_names_a_box_holder_through_its_author() {
+        let f = Fixture::new();
+        let author = "a".repeat(32);
+        f.store
+            .db
+            .with_conn_fenced(|tx| {
+                tx.execute("INSERT INTO member_box VALUES(?1,?2)", [&author, OTHER])?;
+                tx.execute("INSERT INTO member_name VALUES(?1,'Studio')", [&author])?;
+                Ok(())
+            })
+            .unwrap();
+        let body = serde_json::json!({"holder":OTHER,"holder_ep":1,"gen":1,"cut_id":"cut"});
+        f.store
+            .record_hub_kv(
+                &format!("residence.{ID}"),
+                1,
+                Some((b"value", Some(&body))),
+                9,
+            )
+            .unwrap();
+        let context = HubClaimContext {
+            local_box: SELF,
+            fresh: &|_, _| true,
+            holder_current: &|holder, episode, _| holder == OTHER && episode == 1,
+            seed_expected: &|_| false,
+        };
+        let row = f.store.hub_agent_where(ID, &context).unwrap();
+        assert_eq!(row.status, "held_elsewhere");
+        assert_eq!(row.holder_name.as_deref(), Some("Studio"));
     }
 
     #[test]
