@@ -50,6 +50,9 @@ struct Progress {
     pending: Option<PendingCall>,
     #[serde(default)]
     retry_at_ms: i64,
+    /// A forward retry must not delay a newly requested abort.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    retry_is_cleanup: bool,
     #[serde(default)]
     seal_state: Option<SealState>,
     #[serde(default)]
@@ -385,6 +388,7 @@ impl Source {
         row.attempts = 0;
         row.hold = None;
         plan.source.retry_at_ms = 0;
+        plan.source.retry_is_cleanup = false;
     }
 
     pub(crate) async fn tick(&mut self) -> Result<Option<Duration>, HandlerError> {
@@ -415,7 +419,10 @@ impl Source {
             });
             match read {
                 Ok(record) => record,
-                Err(error) => return self.failed(&mut row, &mut plan, error).await,
+                Err(error) => {
+                    let aborting = row.abort_requested.is_some() && row.step != Step::Releasing;
+                    return self.failed(&mut row, &mut plan, error, aborting).await;
+                }
             }
         } else {
             None
@@ -475,12 +482,13 @@ impl Source {
         if self.abort_held {
             return Ok(Some(POLL));
         }
-        if (self.worker.clock)() < plan.source.retry_at_ms {
-            let remaining =
-                Duration::from_millis((plan.source.retry_at_ms - (self.worker.clock)()) as u64);
+        let aborting = row.abort_requested.is_some() && row.step != Step::Releasing;
+        let now = (self.worker.clock)();
+        if (!aborting || plan.source.retry_is_cleanup) && now < plan.source.retry_at_ms {
+            let remaining = Duration::from_millis((plan.source.retry_at_ms - now) as u64);
             return Ok(Some(remaining.min(POLL)));
         }
-        let result = if row.abort_requested.is_some() && row.step != Step::Releasing {
+        let result = if aborting {
             self.cleanup(&mut row, &mut plan, observed, hub_seen.as_ref())
                 .await
         } else {
@@ -493,7 +501,7 @@ impl Source {
             } else {
                 Some(delay)
             }),
-            Err(error) => self.failed(&mut row, &mut plan, error).await,
+            Err(error) => self.failed(&mut row, &mut plan, error, aborting).await,
         }
     }
 
@@ -502,6 +510,7 @@ impl Source {
         row: &mut AgentMove,
         plan: &mut Plan,
         error: Failure,
+        aborting: bool,
     ) -> Result<Option<Duration>, HandlerError> {
         if error.code == "move_state_conflict" && !error.terminal_hub_seal {
             // An inconsistent move/residence pair cannot authorize an abort or a handover.
@@ -583,6 +592,9 @@ impl Source {
             let delay = backoff(row.attempts);
             plan.source.retry_at_ms =
                 (self.worker.clock)().saturating_add(delay.as_millis() as i64);
+            // A forward call can pick up an operator request while saving its
+            // result. Backoff belongs to the path that ran.
+            plan.source.retry_is_cleanup = aborting;
             row.hold = Some(error.hold_with_message(
                 json!({"code":error.code,"module_id":error.module,"op":error.op,
                 "move_error":row.step == Step::Releasing && !error.retryable()}),
@@ -1666,7 +1678,7 @@ mod tests {
         );
         assert!(error.action().is_none());
         f.source()
-            .failed(&mut row, &mut plan, error)
+            .failed(&mut row, &mut plan, error, false)
             .await
             .unwrap_or_else(|error| panic!("source failure: {}", error.code));
         let held = f.row();

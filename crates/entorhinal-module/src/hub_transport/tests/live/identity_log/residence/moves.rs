@@ -1056,6 +1056,106 @@ async fn hub_move_basal_local_advanced_aborts_as_diverged() {
 }
 
 #[tokio::test]
+async fn hub_move_operator_abort_bypasses_source_export_backoff() {
+    let Some(mut f) = Moving::new().await else {
+        return;
+    };
+    set_controlled_now(0);
+    f.source.clock = controlled_clock;
+    let mut source = f.fresh_source();
+    for delay in [
+        1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 300_000,
+    ] {
+        f.from.script(
+            "agent_data.export",
+            ParticipantEffect::Refuse(Refusal {
+                code: "unavailable".into(),
+                detail: None,
+                message: None,
+            }),
+        );
+        source.tick().await.unwrap();
+        let row = f.source.row(CUT).await.unwrap();
+        assert_eq!(row.step, MoveStep::Preparing);
+        assert_eq!(row.hold.unwrap()["op"], "agent_data.export");
+        assert_eq!(
+            row.plan["_source"]["retry_at_ms"],
+            controlled_clock() + delay
+        );
+        if delay < 300_000 {
+            advance_controlled(delay);
+        }
+    }
+    f.from.script(
+        "agent_data.abort",
+        ParticipantEffect::Refuse(Refusal {
+            code: "invalid_request".into(),
+            detail: None,
+            message: None,
+        }),
+    );
+    let abort_calls = || {
+        f.from
+            .calls()
+            .iter()
+            .filter(|call| call.op().method() == "agent_data.abort")
+            .count()
+    };
+
+    store_of(&f.rig.a.handler)
+        .request_agent_move_abort(CUT, controlled_clock())
+        .unwrap();
+    source.tick().await.unwrap();
+    assert_eq!(abort_calls(), 1, "abort must not wait for the export retry");
+
+    // A restarted source still waits for the failed cleanup's retry deadline.
+    advance_controlled(299_999);
+    f.source_tick().await;
+    assert_eq!(abort_calls(), 1);
+    advance_controlled(1);
+    f.source_tick().await;
+    assert_eq!(abort_calls(), 2);
+    assert_eq!(f.source.row(CUT).await.unwrap().step, MoveStep::Aborted);
+}
+
+#[tokio::test]
+async fn hub_move_operator_abort_bypasses_receiver_import_backoff() {
+    let Some(mut f) = Moving::new().await else {
+        return;
+    };
+    set_controlled_now(0);
+    f.receiver.clock = controlled_clock;
+    f.publish().await;
+    poll_hub(&f.receiver, &f.b).await.unwrap();
+    f.to.script(
+        "agent_data.import",
+        ParticipantEffect::Refuse(Refusal {
+            code: "cut_not_ready".into(),
+            detail: None,
+            message: None,
+        }),
+    );
+    f.receiver_tick().await;
+    let row = f.receiver.row(CUT).await.unwrap();
+    assert_eq!(row.step, MoveStep::PickedUp);
+    assert_eq!(row.hold.unwrap()["op"], "agent_data.import");
+    assert_eq!(row.plan["_receiver"]["retry_at_ms"], 1_000);
+
+    f.abort();
+    f.receiver_tick().await;
+    let row = f.receiver.row(CUT).await.unwrap();
+    assert_eq!(row.plan["_receiver"]["hub_decision"], "abort");
+    f.watch(State::Aborted).await;
+    f.receiver_tick().await;
+    assert!(f
+        .to
+        .calls()
+        .iter()
+        .any(|call| call.op().method() == "agent_data.abort"));
+    assert_eq!(f.receiver.row(CUT).await.unwrap().step, MoveStep::Aborted);
+}
+
+#[tokio::test]
 async fn refused_cleanup_backs_off_doubling_to_the_cap_then_aborts() {
     let Some(mut f) = Moving::new().await else {
         return;

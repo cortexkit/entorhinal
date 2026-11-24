@@ -116,6 +116,9 @@ struct Progress {
     errors: Vec<Value>,
     #[serde(default)]
     retry_at_ms: i64,
+    /// A forward retry must not delay a newly requested abort.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    retry_is_cleanup: bool,
     #[serde(default)]
     pending: Option<PendingCall>,
     #[serde(default)]
@@ -525,6 +528,7 @@ impl Receiver {
         row.attempts = 0;
         row.hold = None;
         progress.retry_at_ms = 0;
+        progress.retry_is_cleanup = false;
     }
 
     pub(crate) async fn tick(&mut self) -> Result<Option<Duration>, HandlerError> {
@@ -556,6 +560,8 @@ impl Receiver {
             .map_err(|e| HandlerError::new("plan_malformed", e.to_string()))?;
         wire::check_pinned_plan(&hub_plan.body.participant_plan(), &plan)
             .map_err(|err| error(err.code()))?;
+        let mut aborting =
+            row.abort_requested.is_some() && row.step.before_boundary(MoveSide::Receiver);
         let result: Result<Duration, Failure> = async {
             let (hub, seen) = self.read_hub_move(&hub_plan).await?;
             let observed = seen.body.participant_plan();
@@ -571,6 +577,7 @@ impl Receiver {
                 row.reason = observed.reason.clone().map(String::from);
                 row.detail = observed.detail.clone();
                 row.abort_requested = Some(json!({"reason":row.reason,"detail":row.detail}));
+                aborting = true;
                 self.save(&mut row, &progress).await?;
             }
             if progress.contract_violation.is_some() || progress.activation_fork.is_some() {
@@ -586,11 +593,9 @@ impl Receiver {
                 self.save(&mut row, &progress).await?;
                 return Ok(Duration::ZERO);
             }
-            if (self.worker.clock)() < progress.retry_at_ms {
-                return Ok(Duration::from_millis(
-                    (progress.retry_at_ms - (self.worker.clock)()) as u64,
-                )
-                .min(POLL));
+            let now = (self.worker.clock)();
+            if (!aborting || progress.retry_is_cleanup) && now < progress.retry_at_ms {
+                return Ok(Duration::from_millis((progress.retry_at_ms - now) as u64).min(POLL));
             }
             self.advance_hub(&hub, &seen, &hub_plan, &mut row, &plan, &mut progress)
                 .await
@@ -680,6 +685,7 @@ impl Receiver {
                         row.attempts += 1;
                         progress.retry_at_ms = (self.worker.clock)()
                             .saturating_add(backoff(row.attempts).as_millis() as i64);
+                        progress.retry_is_cleanup = true;
                     } else {
                         progress.retry_at_ms = 0;
                     }
@@ -688,6 +694,10 @@ impl Receiver {
                     let delay = backoff(row.attempts);
                     progress.retry_at_ms =
                         (self.worker.clock)().saturating_add(delay.as_millis() as i64);
+                    // A forward checkpoint can pick up a concurrent abort
+                    // request without having tried cleanup yet.
+                    progress.retry_is_cleanup =
+                        aborting || progress.hub_decision == Some(Decision::Abort);
                     let message = f.hold_message();
                     let mut detail = f.detail;
                     if let Some(message) = &message {
