@@ -602,38 +602,7 @@ mod tests {
     impl Fixture {
         async fn new(cut_over: bool) -> Self {
             let (dir, descriptor) = scratch_descriptor("move-admission");
-            let discovery = Arc::new(Discovery {
-                daemon: FakeDaemon::new(snapshot()),
-                participant: Arc::new(FakeParticipant::new(&["session"], vec![])),
-            });
-            let prompt = Arc::new(Prompt::default());
-            let resolver = FakeResolver::new();
-            resolver.set(
-                ORCHESTRATOR_CAPABILITY,
-                ProviderResolution::Provider("prefrontal".into()),
-            );
-            let mut handler = ProjectsHandler::with_runtime("0123456789abcdef".into(), || 700);
-            handler.participant_discovery = discovery.clone();
-            handler.operator_confirmer = prompt.clone();
-            handler.provider_resolver = resolver;
-            *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
-            for (key, principal) in [
-                (DIRECT, Principal::Direct),
-                (ORCH, reserved("prefrontal")),
-                (ENGRAM, reserved("engram")),
-                (OTHER, reserved("other")),
-            ] {
-                handler
-                    .route_admissions()
-                    .insert(key, RouteAdmission::from_bind(Some(principal), None));
-            }
-            let f = Self {
-                handler: Arc::new(handler),
-                discovery,
-                prompt,
-                descriptor,
-                dir,
-            };
+            let f = Self::open(dir, descriptor, false);
             if cut_over {
                 let mut source = f.descriptor.clone();
                 source.backend = cortexkit_store_types::StorageBackend::Sqlite {
@@ -656,6 +625,73 @@ mod tests {
                 ));
             }
             f
+        }
+
+        async fn migrated() -> Self {
+            use crate::sharing_baselines::{artifacts, force_membership, rows, BASELINE_AGENT};
+            let (dir, descriptor) = scratch_descriptor("move-admission-migrated");
+            let cortexkit_store_types::StorageBackend::Sqlite { path } = &descriptor.backend else {
+                unreachable!();
+            };
+            std::fs::copy(artifacts().join("native-installed.db"), path).unwrap();
+            let pre = rusqlite::Connection::open(path).unwrap();
+            assert_eq!(
+                rows(&pre, "SELECT agent_id FROM claim_cache"),
+                vec![vec![json!(BASELINE_AGENT)]]
+            );
+            drop(pre);
+
+            let f = Self::open(dir, descriptor, true);
+            assert!(f.handler.hub_backend_selected());
+            force_membership(&f.handler, false);
+            f.handler.catalog_sql.wait().await;
+            assert_eq!(f.store().identity_log_status().unwrap().state, "enabled");
+            assert!(f.store().move_authority_cut_over().unwrap());
+            f
+        }
+
+        fn open(
+            dir: std::path::PathBuf,
+            descriptor: cortexkit_store_types::StorageDescriptor,
+            migrated: bool,
+        ) -> Self {
+            let discovery = Arc::new(Discovery {
+                daemon: FakeDaemon::new(snapshot()),
+                participant: Arc::new(FakeParticipant::new(&["session"], vec![])),
+            });
+            let prompt = Arc::new(Prompt::default());
+            let resolver = FakeResolver::new();
+            resolver.set(
+                ORCHESTRATOR_CAPABILITY,
+                ProviderResolution::Provider("prefrontal".into()),
+            );
+            let mut handler = ProjectsHandler::with_runtime("0123456789abcdef".into(), || 700);
+            handler.participant_discovery = discovery.clone();
+            handler.operator_confirmer = prompt.clone();
+            handler.provider_resolver = resolver;
+            let store = RegistryStore::open(&descriptor).unwrap();
+            if migrated {
+                crate::sharing_baselines::install_handler(&handler, store);
+            } else {
+                *handler.store.lock().unwrap() = Some(store);
+            }
+            for (key, principal) in [
+                (DIRECT, Principal::Direct),
+                (ORCH, reserved("prefrontal")),
+                (ENGRAM, reserved("engram")),
+                (OTHER, reserved("other")),
+            ] {
+                handler
+                    .route_admissions()
+                    .insert(key, RouteAdmission::from_bind(Some(principal), None));
+            }
+            Self {
+                handler: Arc::new(handler),
+                discovery,
+                prompt,
+                descriptor,
+                dir,
+            }
         }
 
         fn store(&self) -> RegistryStore {
@@ -775,9 +811,8 @@ mod tests {
 
     #[tokio::test]
     async fn admission_and_validation_precede_the_unselected_backend_refusal() {
-        let f = Fixture::new(true).await;
-        let id = f.create().await;
-        f.install_unselected_hub();
+        let f = Fixture::migrated().await;
+        let id = crate::sharing_baselines::BASELINE_AGENT;
         assert!(super::super::MUTATING_METHODS.contains(&MOVE));
         assert!(super::super::SELF_ADMITTED_METHODS.contains(&MOVE));
         assert!(!super::super::agent_operation_description(MOVE).is_empty());
@@ -785,13 +820,13 @@ mod tests {
             code(f.handler.handle_request(&body(MOVE, json!({})), DIRECT)),
             "served_path_required"
         );
-        assert_eq!(code(f.move_(OTHER, &id).await), "caller_forbidden");
-        assert_eq!(code(f.move_(ENGRAM, &id).await), "caller_forbidden");
+        assert_eq!(code(f.move_(OTHER, id).await), "caller_forbidden");
+        assert_eq!(code(f.move_(ENGRAM, id).await), "caller_forbidden");
         f.handler.route_admissions().insert(
             OTHER,
             RouteAdmission::from_bind(Some(Principal::Direct), Some(&flow_stamp(Some("flow")))),
         );
-        assert_eq!(code(f.move_(OTHER, &id).await), "flow_scope_not_admitted");
+        assert_eq!(code(f.move_(OTHER, id).await), "flow_scope_not_admitted");
         for bad in [
             json!({}),
             json!({"agent_id":id,"to":"Studio","request_key":""}),
@@ -800,14 +835,29 @@ mod tests {
             assert_eq!(code(f.call(DIRECT, MOVE, bad).await), "invalid_request");
         }
         for caller in [DIRECT, ORCH] {
-            assert_eq!(code(f.move_(caller, &id).await), "hub_not_ready");
+            assert_eq!(code(f.move_(caller, id).await), "hub_not_ready");
         }
         f.store()
             .set_move_setting(entorhinal_core::move_store::MoveSetting {
                 lid_close_moves: true,
             })
             .unwrap();
-        assert_eq!(code(f.move_(ENGRAM, &id).await), "hub_not_ready");
+        assert_eq!(code(f.move_(ENGRAM, id).await), "hub_not_ready");
+        f.store()
+            .apply_entry("fixture.retire", "{}", "fixture", None, |tx| {
+                assert_eq!(
+                    tx.execute(
+                        "UPDATE agent SET terminal_reason='retired',terminal_at_ms=701 WHERE agent_id=?1",
+                        [id]
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+        for caller in [DIRECT, ENGRAM] {
+            assert_eq!(code(f.move_(caller, id).await), "gone");
+        }
         f.assert_no_side_effects();
     }
 
@@ -847,13 +897,22 @@ mod tests {
 
     #[tokio::test]
     async fn request_key_replay_precedes_selection_and_target_rename() {
-        let f = Fixture::new(true).await;
-        let id = f.create().await;
-        f.install_unselected_hub();
-        let row = existing_move(&id, "move", "Studio");
+        let f = Fixture::migrated().await;
+        let id = crate::sharing_baselines::BASELINE_AGENT;
+        f.store()
+            .set_member_name(
+                entorhinal_core::shared_entry::MemberName {
+                    author: TARGET.into(),
+                    display_name: "Studio".into(),
+                },
+                "fixture",
+            )
+            .unwrap();
+        let row = existing_move(id, "move", "Studio");
         let expected = result(HandlerOutcome::Response(reply(&row).unwrap()));
         f.store().insert_agent_move(&row).unwrap();
-        assert_eq!(result(f.move_(ORCH, &id).await), expected);
+        assert_eq!(result(f.move_(ORCH, id).await), expected);
+        assert_eq!(result(f.move_(DIRECT, id).await), expected);
         f.store()
             .set_member_name(
                 entorhinal_core::shared_entry::MemberName {
@@ -863,7 +922,7 @@ mod tests {
                 "fixture",
             )
             .unwrap();
-        assert_eq!(result(f.move_(ORCH, &id).await), expected);
+        assert_eq!(result(f.move_(ORCH, id).await), expected);
         assert_eq!(
             code(
                 f.call(
@@ -875,7 +934,7 @@ mod tests {
             ),
             "request_key_reused"
         );
-        assert_eq!(code(f.move_(OTHER, &id).await), "caller_forbidden");
+        assert_eq!(code(f.move_(OTHER, id).await), "caller_forbidden");
         assert!(f.prompt.summaries.lock().unwrap().is_empty());
         assert!(f.discovery.daemon.calls().is_empty());
         assert_eq!(f.store().list_agent_moves().unwrap(), vec![row]);

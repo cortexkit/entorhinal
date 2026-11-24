@@ -346,6 +346,14 @@ async fn hub_catch_up_resumes_saved_enable_and_joins_disabled_store_then_applies
         return;
     };
     let file = StoreFile::copy(&artifacts().join("native-enabling.db"));
+    let frozen_plan = crate::sharing_baselines::rows(
+        &file.read(),
+        "SELECT enable_id,enable_snapshot_digest,enable_parts FROM identity_log_state",
+    );
+    let [frozen] = frozen_plan.as_slice() else {
+        panic!("expected one saved enable plan, got {frozen_plan:?}");
+    };
+    let snapshot: HubSnapshot = serde_json::from_str(frozen[2].as_str().unwrap()).unwrap();
     let fleet = pair_fleet(&rig);
     let a = Machine::new(&rig, file.open(), &fleet, true, false, false);
     let b = Machine::new(
@@ -357,6 +365,14 @@ async fn hub_catch_up_resumes_saved_enable_and_joins_disabled_store_then_applies
         false,
     );
     let saved = a.store().hub_enable_plan().unwrap().unwrap();
+    assert_eq!(
+        frozen,
+        &[
+            json!(saved.enable_id),
+            json!(saved.snapshot_digest),
+            json!(saved.preimage)
+        ]
+    );
     assert_eq!(a.store().hub_log_base().unwrap(), None);
     assert_eq!(b.status().await["state"], "disabled");
     assert!(b.store().hub_enable_plan().unwrap().is_none());
@@ -367,10 +383,7 @@ async fn hub_catch_up_resumes_saved_enable_and_joins_disabled_store_then_applies
         }
     })
     .await;
-    assert_eq!(
-        a.store().installed_hub_snapshot().unwrap().migration_id,
-        saved.enable_id
-    );
+    assert_eq!(a.store().installed_hub_snapshot().unwrap(), snapshot);
     assert!(a.store().hub_enable_plan().unwrap().is_none());
     assert_eq!(a.requests.count("consent"), 0);
     a.requests.assert_allowed();

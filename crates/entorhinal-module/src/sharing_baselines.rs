@@ -4,15 +4,19 @@ use super::*;
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use std::{collections::BTreeMap, fs, path::Path};
 
+#[path = "sharing_baselines/acceptance.rs"]
+mod acceptance;
 #[path = "sharing_baselines/record.rs"]
 pub(crate) mod record;
+#[path = "sharing_baselines/reply_exceptions.rs"]
+mod reply_exceptions;
 
 pub(crate) const NOW: i64 = 700;
 pub(crate) const BOX_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DIRECT: RouteKey = (73, 1);
 const SESSIONS: RouteKey = (73, 2);
 const WRITER: RouteKey = (73, 3);
-const BASELINE_AGENT: &str = "agent_0000000000000001";
+pub(crate) const BASELINE_AGENT: &str = "agent_0000000000000001";
 const STORES: &[(&str, &str, Option<i64>)] = &[
     ("legacy-zero", "enabled", Some(3)),
     ("legacy-supersede", "enabled", Some(8)),
@@ -130,18 +134,22 @@ pub(crate) fn admit(handler: &ProjectsHandler) {
 
 fn open_handler(file: &StoreFile, own: &str) -> ProjectsHandler {
     let handler = ProjectsHandler::with_runtime(own.into(), || NOW);
-    admit(&handler);
+    install_handler(&handler, file.open());
+    handler
+}
+
+pub(crate) fn install_handler(handler: &ProjectsHandler, store: RegistryStore) {
+    admit(handler);
     let tick = Instant::now();
     install_store_with_time(
         &handler.store,
         &handler.health,
         &handler.catalog_sql,
-        Ok(file.open()),
+        Ok(store),
         tick,
         || tick,
     );
     assert!(handler.health.store_ready.load(Ordering::Acquire));
-    handler
 }
 
 pub(crate) async fn call(handler: &ProjectsHandler, method: &str, params: Value) -> String {
@@ -255,12 +263,16 @@ pub(crate) async fn served_reads(
     out
 }
 
-fn force_membership(handler: &ProjectsHandler, selected: bool) {
+pub(crate) fn force_membership(handler: &ProjectsHandler, selected: bool) {
     handler
         .health
         .hub_membership
         .store(u64::from(selected), Ordering::Release);
     assert_eq!(handler.hub_backend_selected(), selected);
+    assert_eq!(
+        handler.health.hub_membership.load(Ordering::Acquire),
+        u64::from(selected)
+    );
     assert!(handler.hub_residence.lock().unwrap().is_none());
 }
 
@@ -664,55 +676,7 @@ async fn sharing_baseline_history_replies_and_prefixes() {
             let path = dir.join(format!("{name}.{kind}"));
             let mut expected = fs::read_to_string(&path).unwrap();
             if kind == "unselected.jsonl" || (kind == "default.jsonl" && base.is_none()) {
-                // Preserve the recorded replies and substitute only the former
-                // cache hit for the first agent in each observer without a hub.
-                let disabled = *state == "disabled";
-                let agent = "agent_0000000000000001";
-                let old_where = json!({"agent_id":agent,"cut_id":null,"epoch":3,
-                    "holder":"11111111111111111111111111111111","holder_name":null,
-                    "known":true,"read_at_ms":700,"stale":false,"status":"held_elsewhere"});
-                let mut old_with_box = old_where.clone();
-                old_with_box["holder_box"] = json!(BOX_A);
-                let new_where = json!({"agent_id":agent,"cut_id":null,"epoch":0,"holder":null,
-                    "holder_name":null,"known":disabled,"read_at_ms":null,"stale":!disabled,"status":"unclaimed"});
-                let old_residence = json!({"agent_id":agent,"epoch":3,
-                    "holder":"11111111111111111111111111111111","read_at_ms":700,"state":"elsewhere"});
-                let new_residence = if disabled {
-                    json!({"agent_id":agent,"epoch":0,"state":"unclaimed"})
-                } else {
-                    json!({"agent_id":agent,"state":"unknown"})
-                };
-                expected = expected
-                    .replace(&old_where.to_string(), &new_where.to_string())
-                    .replace(&old_with_box.to_string(), &new_where.to_string())
-                    .replace(&old_residence.to_string(), &new_residence.to_string());
-                // Migration erases legacy role observations, so those two
-                // roles now read just like an unobserved role on the local path.
-                expected = expected
-                    .split_inclusive('\n')
-                    .map(|line| {
-                        let row: Value = serde_json::from_str(line).unwrap();
-                        if matches!(
-                                row["params"]["role"].as_str(),
-                                Some("connector_home" | "local_role")
-                            )
-                        {
-                            let role = row["params"]["role"].as_str().unwrap();
-                            let method = row["method"].as_str().unwrap();
-                            let result = match method {
-                                "role.read" => json!({"epoch":0,"held_here":false,"holder":null,
-                                    "holder_name":null,"known":false,"role":role,"source":null,"stale":true}),
-                                "role.fence" => json!({"epoch":0,"held_here":false,"holder":null,
-                                    "role":role,"stale":true,"subject":format!("role:{role}"),"version":0}),
-                                _ => panic!("unexpected method for {role}: {method}"),
-                            };
-                            let reply = json!({"result":result});
-                            format!("{{\"method\":\"{method}\",\"params\":{},\"reply\":{reply}}}\n", row["params"])
-                        } else {
-                            line.to_owned()
-                        }
-                    })
-                    .collect();
+                reply_exceptions::apply(&path, name, *state == "disabled", &mut expected);
             }
             assert_eq!(expected, actual, "{}", path.display());
         }
@@ -728,6 +692,7 @@ fn sharing_baseline_migration_preserves_observer_and_adoption_clears_pending() {
     let store = migrate_history(&file, "switch-observer");
     check_store(&file, &store, "enabled", Some(17));
     check_pending(&file, &store);
+    check_rebuild(&file.read(), file.path());
     assert_eq!(fs::read(source).unwrap(), frozen);
 
     let source = artifacts().join("native-installed.db");
@@ -735,9 +700,11 @@ fn sharing_baseline_migration_preserves_observer_and_adoption_clears_pending() {
     let store = file.open();
     check_pending(&file, &store);
     store.check_store_origin(Some(BOX_A), NOW).unwrap();
-    store
-        .adopt_store("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", false, NOW)
-        .unwrap();
+    let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    store.check_store_origin(Some(other), NOW).unwrap();
+    assert!(store.is_foreign());
+    store.adopt_store(other, false, NOW).unwrap();
+    assert!(!store.is_foreign());
     assert_eq!(store.identity_log_status().unwrap().pending_write_count, 0);
 }
 

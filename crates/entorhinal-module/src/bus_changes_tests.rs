@@ -127,6 +127,51 @@ impl Published {
     }
 }
 
+#[tokio::test]
+async fn bus_changes_startup_publishes_zero_role_epoch_after_migration_only_on_own_store() {
+    use crate::sharing_baselines::{artifacts, install_handler, rows, StoreFile, BOX_A, NOW};
+
+    let source = artifacts().join("disabled.db");
+    for (machine, foreign) in [(BOX_A, false), ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", true)] {
+        let file = StoreFile::copy(&source);
+        let conn = Connection::open(file.path()).unwrap();
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT source,epoch FROM role_cache WHERE role='connector_home'"
+            ),
+            vec![vec![json!("cloud"), json!(3)]]
+        );
+        conn.execute(
+            "INSERT INTO store_origin VALUES(?1,?2)",
+            params![BOX_A, NOW],
+        )
+        .unwrap();
+        drop(conn);
+
+        let handler = ProjectsHandler::with_runtime(machine.into(), || NOW);
+        handler.health.origin.set_daemon(Some(machine.into()));
+        let store = file.open();
+        assert!(rows(&file.read(), "SELECT role FROM role_cache").is_empty());
+        install_handler(&handler, store);
+        handler.catalog_sql.wait().await;
+        assert_eq!(handler.health.origin.is_foreign(), foreign);
+
+        if foreign {
+            handler.start_bus_changes();
+            assert!(handler.bus_changes_task.lock().unwrap().is_none());
+        } else {
+            let mut published = Published::start(&handler, Arc::default());
+            published.idle().await;
+            let roles = std::iter::from_fn(|| published.puts.try_recv().ok())
+                .filter_map(|(key, body)| (key == "role.connector_home").then_some(body))
+                .collect::<Vec<_>>();
+            assert_eq!(roles, vec![br#"{"epoch":0}"#.to_vec()]);
+        }
+        crate::tests::stop_store_tasks(&handler).await;
+    }
+}
+
 fn placement_commit(
     store: &RegistryStore,
     id: &str,
