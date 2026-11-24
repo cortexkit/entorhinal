@@ -1,0 +1,3 @@
+[
+  {"op":"agent.where","request":{"agent_id":"agent_0000000000000040"},"reply":{"result":{"cut_id":null,"epoch":1,"holder":"0123456789abcdef0123456789abcdef","holder_box":"0123456789abcdef0123456789abcdef","holder_name":null,"known":true,"moving":{"cut_id":"aabb0123456789abcdef0123456789ab","hold":{"code":"unavailable","message":"Session archive is still being indexed","module_id":"data","move_error":false,"op":"agent_data.export"},"peer":"fedcba9876543210fedcba9876543210","peer_name":"Studio","side":"source","step":"preparing"},"read_at_ms":700,"stale":false,"status":"held_here"}}}
+]

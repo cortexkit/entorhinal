@@ -338,6 +338,7 @@ fn agent_identity_vector(directory: &str, name: &str) -> bool {
                 | "where-many-hub-startup.json"
                 | "where-moving-hub-source.json"
                 | "where-moving-hub-receiver.json"
+                | "where-moving-hold-message.json"
                 | "where-sharing-off.json"
                 | "session-for-ref.json"
                 | "session-for-runner.json"
@@ -516,6 +517,7 @@ fn agent_identity_published_records_roundtrip_exactly() {
         ("agent-sessions-v1", "where-many-hub-startup.json"),
         ("agent-sessions-v1", "where-moving-hub-source.json"),
         ("agent-sessions-v1", "where-moving-hub-receiver.json"),
+        ("agent-sessions-v1", "where-moving-hold-message.json"),
         ("agent-sessions-v1", "where-sharing-off.json"),
         ("agent-sessions-v1", "session-for-ref.json"),
         ("agent-sessions-v1", "session-for-runner.json"),

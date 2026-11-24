@@ -293,6 +293,86 @@ async fn hub_residence_moving_samples() {
 }
 
 #[tokio::test]
+async fn hub_residence_moving_hold_message_sample() {
+    let Some(mut f) = Moving::new().await else {
+        return;
+    };
+    let node = &f.rig.a;
+    bind(&node.handler, subc_protocol::Principal::Direct);
+    record_display_name(node, &"b5".repeat(16), B, "Studio");
+    f.source.clock = controlled_clock;
+    set_controlled_now(650);
+    let refuse_export = |message| {
+        f.from.script(
+            "agent_data.export",
+            ParticipantEffect::Refuse(Refusal {
+                code: "unavailable".into(),
+                detail: None,
+                message,
+            }),
+        );
+    };
+    let message = "Session archive is still being indexed";
+    refuse_export(Some(message.into()));
+    let mut source = f.fresh_source();
+    source.tick().await.unwrap();
+
+    let sample = cutover_sample(&node.handler, "agent.where", json!({"agent_id":MIGRATED})).await;
+    let reply: Value = serde_json::from_str(&sample).unwrap();
+    let moving = &reply["reply"]["result"]["moving"];
+    assert_eq!(moving["step"], "preparing");
+    assert_eq!(
+        moving["hold"],
+        json!({"code":"unavailable","module_id":"data","op":"agent_data.export",
+            "move_error":false,"message":message})
+    );
+    let batch = cutover_sample(
+        &node.handler,
+        "agent.where_many",
+        json!({"agentIds":[MIGRATED]}),
+    )
+    .await;
+    let batch: Value = serde_json::from_str(&batch).unwrap();
+    assert_eq!(
+        batch["reply"]["result"]["agents"][0]["moving"]["hold"],
+        moving["hold"]
+    );
+    let listing = cutover_sample(&node.handler, "agent.moves", json!({})).await;
+    let listing: Value = serde_json::from_str(&listing).unwrap();
+    assert_eq!(
+        listing["reply"]["result"]["moves"][0]["hold"],
+        moving["hold"]
+    );
+
+    let long = format!("a\n\u{0085}{}🙂trailing", "é".repeat(254));
+    let bounded = format!("a  {}", "é".repeat(254));
+    for (wait, message, expected) in [
+        (1_000, Some(long.clone()), Some(bounded.as_str())),
+        (2_000, Some(long), Some(bounded.as_str())),
+        (4_000, None, None),
+    ] {
+        advance_controlled(wait);
+        refuse_export(message);
+        source.tick().await.unwrap();
+        let row = f.source.row(CUT).await.unwrap();
+        let hold = row.hold.unwrap();
+        assert_eq!(hold.get("message").and_then(Value::as_str), expected);
+        if expected.is_none() {
+            assert_eq!(
+                hold,
+                json!({"code":"unavailable","module_id":"data","op":"agent_data.export",
+                    "move_error":false})
+            );
+        }
+    }
+    published_file(
+        "agent-sessions-v1",
+        "where-moving-hold-message.json",
+        vec![sample],
+    );
+}
+
+#[tokio::test]
 async fn hub_move_restarts_through_the_full_handoff() {
     let Some(f) = Moving::new().await else {
         return;
@@ -1370,13 +1450,22 @@ async fn hub_move_import_refusal_retry_survives_restart() {
             ParticipantEffect::Refuse(Refusal {
                 code: code.into(),
                 detail: None,
-                message: None,
+                message: (code == "busy").then(|| format!("\t{}", "a".repeat(512))),
             }),
         );
         f.publish().await;
         poll_hub(&f.receiver, &f.b).await.unwrap();
         f.receiver_tick().await;
-        assert_eq!(f.receiver.row(CUT).await.unwrap().step, MoveStep::PickedUp);
+        let row = f.receiver.row(CUT).await.unwrap();
+        assert_eq!(row.step, MoveStep::PickedUp);
+        let hold = row.hold.unwrap();
+        if code == "busy" {
+            assert_eq!(hold["message"], format!(" {}", "a".repeat(511)));
+            assert_eq!(hold["detail"]["message"], hold["message"]);
+        } else {
+            assert!(hold.get("message").is_none());
+            assert!(hold["detail"].get("message").is_none());
+        }
         advance_controlled(1000);
         f.fresh_receiver().tick().await.unwrap();
         let row = f.receiver.row(CUT).await.unwrap();

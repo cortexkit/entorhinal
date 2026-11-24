@@ -185,6 +185,11 @@ a backfill makes the data local.
   `moving.step: "staged"`. Both move records include `peer`, `peer_name`,
   and `cut_id` in `moving`. The rig fixes the source worker's clock at `650`
   and the reply clock at `700`; it does not rewrite any reply fields.
+- **`where-moving-hold-message.json`**: the source is `held_here` and its move
+  remains `preparing` after the `data` participant refuses `agent_data.export`
+  with retryable `unavailable`. `moving.hold.message` gives the participant's
+  reason. Hold messages are capped at 512 UTF-8 bytes, with control characters
+  replaced by spaces; a refusal without a message omits the member.
 - **`register-session-runner.json`**: a Broca worker registration naming
   runner `broca`; the reply bytes have the same shape as a registration
   without one.
@@ -323,6 +328,7 @@ a backfill makes the data local.
 | `register-session-delegated.json` | `515608c3f46f5a8ac20a9dca47e7cd9d79cc13c43d2459434694b41bccf6660e` |
 | `sessions-delegated.json` | `b210b3e6b3e0530cf0cb0cf8be597a2ea76ef72dea342a7de3d294abb2511c16` |
 | `register-session-unknown-role.json` | `f238eded045694910731007b61e3af2842b244be9fc3b166e26725b9092f00ee` |
+| `where-moving-hold-message.json` | `3fa915d8449a8314526d7961b11a9fd01920f8b911be64bc9d57d7435de08a8f` |
 
 ## Reproduce and verify
 

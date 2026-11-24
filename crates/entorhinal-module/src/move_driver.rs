@@ -141,6 +141,23 @@ pub(crate) struct PeerRefusal {
     pub(crate) message: Option<String>,
 }
 
+impl PeerRefusal {
+    pub(crate) fn hold_message(&self) -> Option<String> {
+        const MAX_BYTES: usize = 512;
+        let message = self.message.as_deref()?;
+        let mut bounded = String::with_capacity(message.len().min(MAX_BYTES));
+        for ch in message.chars() {
+            // A hold can be displayed on a terminal; keep the text on one line.
+            let ch = if ch.is_control() { ' ' } else { ch };
+            if bounded.len() + ch.len_utf8() > MAX_BYTES {
+                break;
+            }
+            bounded.push(ch);
+        }
+        Some(bounded)
+    }
+}
+
 /// Writes one fleet-log line the first time a move's driver sees a given
 /// refusal, so an operator can read why engram or a participant said no.
 /// Retries of the same refusal repeat every backoff interval and would

@@ -337,6 +337,13 @@ impl Failure {
         }
         failure
     }
+
+    fn hold_message(&self) -> Option<String> {
+        self.refusal
+            .as_deref()
+            .filter(|_| self.detail["module_id"].is_string())
+            .and_then(PeerRefusal::hold_message)
+    }
 }
 impl From<HandlerError> for Failure {
     fn from(e: HandlerError) -> Self {
@@ -625,6 +632,9 @@ impl Receiver {
                     f.detail["step"] = json!(row.step);
                     f.detail["move_error"] = json!(true);
                     row.detail = Some(f.detail.clone());
+                    if let Some(message) = f.hold_message() {
+                        f.detail["message"] = json!(message);
+                    }
                     row.hold = Some(f.detail);
                     progress.retry_at_ms = 0;
                     self.save(&mut row, &progress)
@@ -678,23 +688,21 @@ impl Receiver {
                     let delay = backoff(row.attempts);
                     progress.retry_at_ms =
                         (self.worker.clock)().saturating_add(delay.as_millis() as i64);
-                    row.hold = Some(
-                        json!({"code":f.code,"detail":f.detail,"move_error":f.violation || f.diagnostic}),
-                    );
-                    if let Some(module) = f.detail.get("module_id") {
-                        row.hold
-                            .as_mut()
-                            .expect("this branch assigned Some(hold) immediately above")
-                            ["module_id"] = module.clone();
+                    let message = f.hold_message();
+                    let mut detail = f.detail;
+                    if let Some(message) = &message {
+                        detail["message"] = json!(message);
                     }
-                    for key in ["ref", "reason_code", "reason", "op", "note"] {
-                        if let Some(value) = f.detail.get(key) {
-                            row.hold
-                                .as_mut()
-                                .expect("this branch assigned Some(hold) immediately above")[key] =
-                                value.clone();
+                    let mut hold = json!({"code":f.code,"detail":detail,"move_error":f.violation || f.diagnostic});
+                    for key in ["module_id", "ref", "reason_code", "reason", "op", "note"] {
+                        if let Some(value) = detail.get(key) {
+                            hold[key] = value.clone();
                         }
                     }
+                    if let Some(message) = message {
+                        hold["message"] = json!(message);
+                    }
+                    row.hold = Some(hold);
                 }
                 self.save(&mut row, &progress)
                     .await

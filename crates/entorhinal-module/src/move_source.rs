@@ -244,6 +244,17 @@ impl Failure {
     fn message(&self) -> Option<&str> {
         self.refusal.as_ref().and_then(|r| r.message.as_deref())
     }
+    fn hold_with_message(&self, mut hold: Value) -> Value {
+        if let Some(message) = self
+            .refusal
+            .as_deref()
+            .filter(|_| self.module.is_some())
+            .and_then(PeerRefusal::hold_message)
+        {
+            hold["message"] = json!(message);
+        }
+        hold
+    }
     fn detail(&self) -> Value {
         let mut detail = json!({"op":self.op,"code":self.code,"detail":self.detail,
             "contract_violation":self.contract_violation});
@@ -496,7 +507,7 @@ impl Source {
             // An inconsistent move/residence pair cannot authorize an abort or a handover.
             let detail = error.detail();
             plan.source.contract_violation = Some(detail.clone());
-            row.hold = Some(detail.clone());
+            row.hold = Some(error.hold_with_message(detail.clone()));
             row.detail = Some(detail);
             self.save(row, plan, false)
                 .await
@@ -527,7 +538,7 @@ impl Source {
             detail["step"] = json!(row.step);
             detail["move_error"] = json!(true);
             row.detail = Some(detail.clone());
-            row.hold = Some(detail);
+            row.hold = Some(error.hold_with_message(detail));
             plan.source.retry_at_ms = 0;
             self.save(row, plan, false)
                 .await
@@ -546,7 +557,7 @@ impl Source {
                 // Stop calls durably rather than retrying in either case.
                 plan.source.contract_violation = Some(detail.clone());
                 row.detail = Some(detail.clone());
-                row.hold = Some(detail);
+                row.hold = Some(error.hold_with_message(detail));
                 plan.source.retry_at_ms = 0;
                 self.save(row, plan, false)
                     .await
@@ -572,10 +583,10 @@ impl Source {
             let delay = backoff(row.attempts);
             plan.source.retry_at_ms =
                 (self.worker.clock)().saturating_add(delay.as_millis() as i64);
-            row.hold = Some(
+            row.hold = Some(error.hold_with_message(
                 json!({"code":error.code,"module_id":error.module,"op":error.op,
                 "move_error":row.step == Step::Releasing && !error.retryable()}),
-            );
+            ));
             self.save(row, plan, false)
                 .await
                 .map_err(|f| HandlerError::new(&f.code, f.detail.to_string()))?;
