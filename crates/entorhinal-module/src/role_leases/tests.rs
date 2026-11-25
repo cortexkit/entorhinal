@@ -446,6 +446,152 @@ impl Drop for ClientWatch {
 }
 
 #[tokio::test(start_paused = true)]
+async fn role_lease_timeout_and_late_ack_log_reasons() {
+    let hub = Hub::new(None, false);
+    let mut watch = ClientWatch::open(A, &hub, true).await;
+    let notice = watch.next();
+    tick(ACK_MS).await;
+    assert!(watch.task.is_finished());
+    let error = watch
+        .handler
+        .ack_role_lease(json!({"role": ROLE, "seq": notice.seq}), ROUTE)
+        .unwrap_err();
+    assert_eq!(error.code, "caller_forbidden");
+    let lines = watch.handler.role_leases.log_lines.lock().unwrap();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("watch_open role=\"connector_home\" channel=3 epoch=1")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("watch_end")
+            && line.contains("open_ms=5000")
+            && line.contains(&format!("last_seq=Some({})", notice.seq))
+            && line.contains("holding=false")
+            && line.contains("reason=ack_timeout")
+            && line.contains(&format!("unacked_seq=Some({})", notice.seq))),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("control_refused")
+            && line.contains("channel=3 epoch=1")
+            && line.contains(&format!("requested_seq={}", notice.seq))
+            && line.contains("reason=no_watch_registered")),
+        "{lines:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn role_lease_wrong_route_and_stale_ack_log_reasons() {
+    let hub = Hub::new(None, false);
+    let mut watch = ClientWatch::open(A, &hub, true).await;
+    let notice = watch.next();
+    let other = (ROUTE.0, ROUTE.1 + 1);
+    watch.handler.route_admissions().insert(
+        other,
+        crate::RouteAdmission::from_bind(Some(crate::tests::reserved("plexus")), None),
+    );
+    let error = watch
+        .handler
+        .ack_role_lease(json!({"role": ROLE, "seq": notice.seq}), other)
+        .unwrap_err();
+    assert_eq!(error.code, "caller_forbidden");
+    let error = watch
+        .handler
+        .release_role_lease(json!({"role": ROLE, "gen": notice.gen}), other)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "caller_forbidden");
+    let error = watch
+        .handler
+        .ack_role_lease(json!({"role": ROLE, "seq": notice.seq + 1}), ROUTE)
+        .unwrap_err();
+    assert_eq!(error.code, "lease_ack_stale");
+    let lines = watch.handler.role_leases.log_lines.lock().unwrap();
+    assert!(
+        lines.iter().any(|line| line.contains("channel=3 epoch=2")
+            && line.contains("op=ack")
+            && line.contains("reason=different_route registered_channel=3 registered_epoch=1")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("op=release")
+            && line.contains("requested_gen=")
+            && line.contains("reason=different_route")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("channel=3 epoch=1")
+            && line.contains(&format!("requested_seq={}", notice.seq + 1))
+            && line.contains("reason=lease_ack_stale")),
+        "{lines:?}"
+    );
+}
+
+struct CancelSink {
+    notices: mpsc::UnboundedSender<Notice>,
+    cancel: watch::Sender<bool>,
+}
+
+#[async_trait::async_trait]
+impl WatchTransport for CancelSink {
+    async fn emit(&self, body: Vec<u8>) -> Result<(), HandlerError> {
+        self.notices
+            .send(serde_json::from_slice(&body).unwrap())
+            .unwrap();
+        Ok(())
+    }
+
+    async fn ended(&self) {
+        let _ = self
+            .cancel
+            .subscribe()
+            .wait_for(|cancelled| *cancelled)
+            .await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn role_lease_caller_close_and_drain_log_distinct_reasons() {
+    for (draining, reason) in [(false, "caller_closed"), (true, "module_draining")] {
+        let hub = Hub::new(None, false);
+        let mut handler = ProjectsHandler::with_runtime("role-test".into(), || 0);
+        handler.route_admissions().insert(
+            ROUTE,
+            crate::RouteAdmission::from_bind(Some(crate::tests::reserved("plexus")), None),
+        );
+        let leases = Arc::get_mut(&mut handler.role_leases).unwrap();
+        leases.attach(Some(Arc::new(Peer::new(A, &hub, true))));
+        let (notices, mut received) = mpsc::unbounded_channel();
+        let sink = CancelSink {
+            notices,
+            cancel: watch::channel(false).0,
+        };
+        let body = serde_json::to_vec(&json!({"method": WATCH, "params": {"role": ROLE}})).unwrap();
+        let future = handler.serve_watch(&sink, &body, ROUTE);
+        tokio::pin!(future);
+        tokio::select! {
+            notice = received.recv() => assert!(notice.is_some()),
+            _ = &mut future => panic!("watch ended before notice"),
+        }
+        if draining {
+            handler.draining.send_replace(true);
+        } else {
+            sink.cancel.send_replace(true);
+        }
+        future.await;
+        let lines = handler.role_leases.log_lines.lock().unwrap();
+        assert!(
+            lines.iter().any(
+                |line| line.contains("watch_end") && line.contains(&format!("reason={reason}"))
+            ),
+            "{lines:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn lease_renews_same_generation_every_twenty_seconds() {
     let hub = Hub::new(None, false);
     let mut a = ClientWatch::open(A, &hub, true).await;

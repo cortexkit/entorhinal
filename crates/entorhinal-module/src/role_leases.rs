@@ -113,6 +113,8 @@ pub(super) struct Leases {
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     backend: watch::Sender<Option<Arc<dyn Backend>>>,
     #[cfg(test)]
+    log_lines: Mutex<Vec<String>>,
+    #[cfg(test)]
     sample_views: HashMap<String, watch::Receiver<View>>,
     #[cfg(test)]
     pub(super) local_pass_complete: Notify,
@@ -129,6 +131,8 @@ impl Default for Leases {
             clock: Arc::new(monotonic_ms),
             backend: watch::channel(None).0,
             #[cfg(test)]
+            log_lines: Mutex::default(),
+            #[cfg(test)]
             sample_views: HashMap::new(),
             #[cfg(test)]
             local_pass_complete: Notify::new(),
@@ -143,6 +147,21 @@ struct Registration<'a> {
     role: String,
     holding: bool,
     watch_open: Arc<AtomicBool>,
+    route: RouteKey,
+    opened: Instant,
+    last_seq: Option<u64>,
+    end: Arc<Mutex<WatchEnd>>,
+}
+
+#[derive(Default)]
+pub(super) enum WatchEnd {
+    #[default]
+    Other,
+    CallerClosed,
+    ModuleDraining,
+    AckTimeout(u64),
+    SendFailed(String),
+    ViewsClosed,
 }
 
 impl Registration<'_> {
@@ -158,6 +177,19 @@ impl Registration<'_> {
 
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
+        let end = self.end.lock().unwrap();
+        let (reason, unacked_seq, error) = match &*end {
+            WatchEnd::Other => ("other", None, ""),
+            WatchEnd::CallerClosed => ("caller_closed", None, ""),
+            WatchEnd::ModuleDraining => ("module_draining", None, ""),
+            WatchEnd::AckTimeout(seq) => ("ack_timeout", Some(*seq), ""),
+            WatchEnd::SendFailed(error) => ("send_failed", None, error.as_str()),
+            WatchEnd::ViewsClosed => ("views_closed", None, ""),
+        };
+        let line = format!("watch_end role={:?} channel={} epoch={} open_ms={} last_seq={:?} holding={} reason={} unacked_seq={:?} error={:?}",
+            self.role, self.route.0, self.route.1, self.opened.elapsed().as_millis(), self.last_seq, self.holding, reason, unacked_seq, error);
+        self.leases.info(&line);
+        drop(end);
         self.watch_open.store(false, Ordering::Release);
         self.holding(false);
         self.leases.clients.lock().unwrap().remove(&self.role);
@@ -184,6 +216,18 @@ impl Drop for Registration<'_> {
 }
 
 impl Leases {
+    fn info(&self, line: &str) {
+        #[cfg(test)]
+        self.log_lines.lock().unwrap().push(line.to_owned());
+        tracing::info!(target: "role_lease", "{line}");
+    }
+
+    fn warn(&self, line: &str) {
+        #[cfg(test)]
+        self.log_lines.lock().unwrap().push(line.to_owned());
+        tracing::warn!(target: "role_lease", "{line}");
+    }
+
     pub(super) fn held(&self) -> u64 {
         self.held.load(Ordering::Relaxed)
     }
@@ -210,7 +254,7 @@ impl Leases {
     #[cfg(test)]
     pub(crate) fn baseline_lease(&self, role: &str, gen: i64) -> impl Drop + '_ {
         let (client, mut registration) = self
-            .register(role.into(), (73, 4), mpsc::channel(1).0)
+            .register(role.into(), (73, 4), mpsc::channel(1).0, Arc::default())
             .unwrap();
         *client.view.lock().unwrap() = View {
             gen,
@@ -231,6 +275,7 @@ impl Leases {
         role: String,
         route: RouteKey,
         control: mpsc::Sender<Control>,
+        end: Arc<Mutex<WatchEnd>>,
     ) -> Result<(Arc<Client>, Registration<'_>), HandlerError> {
         use std::collections::hash_map::Entry;
 
@@ -253,6 +298,10 @@ impl Leases {
             }
             Entry::Vacant(entry) => entry.insert(client.clone()),
         };
+        self.info(&format!(
+            "watch_open role={role:?} channel={} epoch={}",
+            route.0, route.1
+        ));
         Ok((
             client,
             Registration {
@@ -260,23 +309,41 @@ impl Leases {
                 role,
                 holding: false,
                 watch_open,
+                route,
+                opened: Instant::now(),
+                last_seq: None,
+                end,
             },
         ))
     }
 
-    fn client(&self, role: &str, route: RouteKey) -> Result<Arc<Client>, HandlerError> {
-        self.clients
-            .lock()
-            .unwrap()
-            .get(role)
-            .filter(|client| client.route == route)
-            .cloned()
-            .ok_or_else(|| {
-                HandlerError::new(
+    fn client(
+        &self,
+        role: &str,
+        route: RouteKey,
+        requested: &str,
+    ) -> Result<Arc<Client>, HandlerError> {
+        let clients = self.clients.lock().unwrap();
+        match clients.get(role) {
+            Some(client) if client.route == route => Ok(client.clone()),
+            client => {
+                let reason = match client {
+                    Some(client) => format!(
+                        "different_route registered_channel={} registered_epoch={}",
+                        client.route.0, client.route.1
+                    ),
+                    None => "no_watch_registered".to_owned(),
+                };
+                self.warn(&format!(
+                    "control_refused role={role:?} channel={} epoch={} {requested} reason={reason}",
+                    route.0, route.1
+                ));
+                Err(HandlerError::new(
                     "caller_forbidden",
                     "use the route that opened the role lease watch",
-                )
-            })
+                ))
+            }
+        }
     }
 
     async fn notices(
@@ -296,6 +363,7 @@ impl Leases {
                 .saturating_sub(issued_at_ms);
             let holding = valid_for_ms != 0;
             let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+            registration.last_seq = Some(seq);
             *client.awaiting.lock().unwrap() = Some((seq, issued_at_ms + ACK_MS));
             *client.view.lock().unwrap() = view;
             let notice = Notice {
@@ -321,8 +389,15 @@ impl Leases {
                 tokio::select! {
                     result = &mut ack => {
                         match result {
-                            Ok(result) => result?,
-                            Err(_) => return Ok(()),
+                            Ok(Err(error)) => {
+                                *registration.end.lock().unwrap() = WatchEnd::SendFailed(error.message.clone());
+                                return Err(error);
+                            }
+                            Ok(Ok(())) => {},
+                            Err(_) => {
+                                *registration.end.lock().unwrap() = WatchEnd::AckTimeout(seq);
+                                return Ok(());
+                            },
                         }
                         break;
                     }
@@ -333,6 +408,7 @@ impl Leases {
                 tokio::select! {
                     result = views.changed() => {
                         if result.is_err() {
+                            *registration.end.lock().unwrap() = WatchEnd::ViewsClosed;
                             return Ok(());
                         }
                         break;
@@ -1274,7 +1350,11 @@ impl ProjectsHandler {
         }
         let request: Request = decode(params)?;
         self.admit_lease_role(&request.role, key)?;
-        let client = self.role_leases.client(&request.role, key)?;
+        let client = self.role_leases.client(
+            &request.role,
+            key,
+            &format!("op=ack requested_seq={}", request.seq),
+        )?;
         let mut awaiting = client.awaiting.lock().unwrap();
         if awaiting
             .is_some_and(|(seq, deadline)| request.seq == seq && self.role_leases.now() < deadline)
@@ -1284,6 +1364,7 @@ impl ProjectsHandler {
             client.changed.notify_one();
             return encode_result(json!({"acknowledged":true}));
         }
+        self.role_leases.warn(&format!("control_refused role={:?} channel={} epoch={} op=ack requested_seq={} reason=lease_ack_stale", request.role, key.0, key.1, request.seq));
         Err(HandlerError::new(
             "lease_ack_stale",
             "no matching role lease notice is awaiting ack",
@@ -1320,7 +1401,15 @@ impl ProjectsHandler {
         }
         let request: Request = decode(params)?;
         self.admit_lease_role(&request.role, key)?;
-        let client = self.role_leases.client(&request.role, key)?;
+        let client = self.role_leases.client(
+            &request.role,
+            key,
+            &format!(
+                "op={} requested_gen={}",
+                if yielding { "yield" } else { "release" },
+                request.gen
+            ),
+        )?;
         let view = *client.view.lock().unwrap();
         if view.gen != request.gen || view.until_ms.is_none() {
             return Err(HandlerError::new(
@@ -1372,14 +1461,26 @@ impl ProjectsHandler {
         })
     }
 
+    #[cfg(test)]
     pub(super) async fn serve_role_lease(
         &self,
         transport: &impl WatchTransport,
         role: String,
         key: RouteKey,
     ) -> Result<(), HandlerError> {
+        self.serve_role_lease_with_end(transport, role, key, Arc::default())
+            .await
+    }
+
+    pub(super) async fn serve_role_lease_with_end(
+        &self,
+        transport: &impl WatchTransport,
+        role: String,
+        key: RouteKey,
+        end: Arc<Mutex<WatchEnd>>,
+    ) -> Result<(), HandlerError> {
         let (release, releases) = mpsc::channel(1);
-        let (client, registration) = self.role_leases.register(role.clone(), key, release)?;
+        let (client, registration) = self.role_leases.register(role.clone(), key, release, end)?;
         let mut local_gen = None;
         let initial = if self.role_leases.backend.borrow().is_some() {
             View::default()

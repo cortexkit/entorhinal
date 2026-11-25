@@ -255,11 +255,21 @@ impl ProjectsHandler {
             if request.method == crate::role_leases::WATCH {
                 let role = self.admit_role_lease_watch(request.params, key)?;
                 let mut draining = self.draining.subscribe();
+                let end =
+                    std::sync::Arc::new(std::sync::Mutex::new(crate::role_leases::WatchEnd::Other));
+                let lease = self.serve_role_lease_with_end(transport, role, key, end.clone());
+                tokio::pin!(lease);
                 return tokio::select! {
                     biased;
-                    _ = transport.ended() => Ok(()),
-                    _ = draining.wait_for(|stopping| *stopping) => Ok(()),
-                    result = self.serve_role_lease(transport, role, key) => result,
+                    _ = transport.ended() => {
+                        *end.lock().unwrap() = crate::role_leases::WatchEnd::CallerClosed;
+                        Ok(())
+                    },
+                    _ = draining.wait_for(|stopping| *stopping) => {
+                        *end.lock().unwrap() = crate::role_leases::WatchEnd::ModuleDraining;
+                        Ok(())
+                    },
+                    result = &mut lease => result,
                 };
             }
             // Validate before consuming a slot, with exactly the existing read
