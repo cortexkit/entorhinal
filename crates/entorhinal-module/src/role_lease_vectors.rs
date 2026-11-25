@@ -154,6 +154,42 @@ async fn served_role_lease_v1_records_match_published_files() {
         refusals.push(output(WATCH, &params, &principal, &[refused]));
     }
     publish("refusals.json", refusals);
+
+    let params = json!({"role":PROJECT});
+    let corr = module
+        .send_request(mc, request(WATCH, params.clone()))
+        .await;
+    let first = frame(&mut module, corr, FrameType::StreamData).await;
+    let notice: Value = serde_json::from_slice(&first.body).unwrap();
+    let ack = json!({"role":PROJECT,"seq":notice["seq"]});
+    clock.fetch_add(5_001, Ordering::Relaxed);
+    tokio::time::advance(Duration::from_millis(5_001)).await;
+    let last = frame(&mut module, corr, FrameType::StreamEnd).await;
+    let id = module.send_request(mc, request(ACK, ack.clone())).await;
+    let refused = frame(&mut module, id, FrameType::Error).await;
+    let mut ended_records = vec![
+        output(WATCH, &params, &m, &[first, last]),
+        output(ACK, &ack, &m, &[refused]),
+    ];
+
+    let corr = module
+        .send_request(mc, request(WATCH, params.clone()))
+        .await;
+    let first = frame(&mut module, corr, FrameType::StreamData).await;
+    let notice: Value = serde_json::from_slice(&first.body).unwrap();
+    let ack = json!({"role":PROJECT,"seq":notice["seq"]});
+    let id = module
+        .send_request(second_mc, request(ACK, ack.clone()))
+        .await;
+    let refused = frame(&mut module, id, FrameType::Error).await;
+    ended_records.push(output(WATCH, &params, &m, &[first]));
+    let mut other = m;
+    other["differentRoute"] = json!(true);
+    ended_records.push(output(ACK, &ack, &other, &[refused]));
+    module.cancel_request(mc, corr).await;
+    frame(&mut module, corr, FrameType::StreamEnd).await;
+    publish("ack-after-watch-ended.json", ended_records);
+
     drop(sources);
     module.shutdown().await;
     crate::tests::stop_store_tasks(&handler).await;

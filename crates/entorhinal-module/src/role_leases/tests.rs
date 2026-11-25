@@ -456,7 +456,11 @@ async fn role_lease_timeout_and_late_ack_log_reasons() {
         .handler
         .ack_role_lease(json!({"role": ROLE, "seq": notice.seq}), ROUTE)
         .unwrap_err();
-    assert_eq!(error.code, "caller_forbidden");
+    assert_eq!(error.code, "lease_watch_closed");
+    assert_eq!(
+        error.message,
+        "no role lease watch is open for this role; it may have ended after an unacknowledged notice. Open a new watch."
+    );
     let lines = watch.handler.role_leases.log_lines.lock().unwrap();
     assert!(
         lines
@@ -497,6 +501,10 @@ async fn role_lease_wrong_route_and_stale_ack_log_reasons() {
         .ack_role_lease(json!({"role": ROLE, "seq": notice.seq}), other)
         .unwrap_err();
     assert_eq!(error.code, "caller_forbidden");
+    assert_eq!(
+        error.message,
+        "use the route that opened the role lease watch"
+    );
     let error = watch
         .handler
         .release_role_lease(json!({"role": ROLE, "gen": notice.gen}), other)

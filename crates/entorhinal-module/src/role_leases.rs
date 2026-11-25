@@ -338,10 +338,17 @@ impl Leases {
                     "control_refused role={role:?} channel={} epoch={} {requested} reason={reason}",
                     route.0, route.1
                 ));
-                Err(HandlerError::new(
-                    "caller_forbidden",
-                    "use the route that opened the role lease watch",
-                ))
+                Err(if client.is_some() {
+                    HandlerError::new(
+                        "caller_forbidden",
+                        "use the route that opened the role lease watch",
+                    )
+                } else {
+                    HandlerError::new(
+                        "lease_watch_closed",
+                        "no role lease watch is open for this role; it may have ended after an unacknowledged notice. Open a new watch.",
+                    )
+                })
             }
         }
     }

@@ -525,9 +525,14 @@ The holder renews every 20 s; act only within the confirmed monotonic window
 in the notice (`issued_at_ms + valid_for_ms`), at most 45 s from the renewal's
 send. Ack each notice via `role.lease.ack {role, seq}` within 5 s, and use
 `role.lease.release {role, gen}` after stopping or `role.lease.yield {role, gen}`
-after honoring a handback. Fence irreversible work by the lease `gen`; this
-is distinct from the changing KV revision returned by `role.fence`. A reader
-must not infer a live local lease from `role.read` or a successful `role.take`.
+after honoring a handback. These calls must use the route that opened the
+watch. If no watch is registered for the role (for example, after a missed
+ack), the call returns `lease_watch_closed`; open a new watch. If the watch is
+still open on another route, the call returns `caller_forbidden`. An ack that
+does not match a notice still awaiting acknowledgement returns `lease_ack_stale`.
+Fence irreversible work by the lease `gen`; this is distinct from the
+changing KV revision returned by `role.fence`. A reader must not infer a live
+local lease from `role.read` or a successful `role.take`.
 Once a member's removal is applied, the role lease held by that episode is void.
 A candidate can acquire it without waiting for expiry or an operator take. A
 computer that sees the replacement before the removal holds it until it applies
