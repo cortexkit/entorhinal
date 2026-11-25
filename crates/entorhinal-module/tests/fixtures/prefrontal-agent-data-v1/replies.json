@@ -1,0 +1,462 @@
+[
+  {
+    "name": "describe",
+    "node": "origin",
+    "reply": {
+      "result": {
+        "external": false,
+        "ref_kinds": [
+          "prefrontal-agent"
+        ],
+        "stores": [
+          {
+            "name": "prefrontal-agent",
+            "sync_class": "agent"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.describe",
+      "params": {}
+    }
+  },
+  {
+    "name": "busy-idle",
+    "node": "origin",
+    "reply": {
+      "result": {
+        "refs": [
+          {
+            "state": "idle"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.busy",
+      "params": {
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "status-none",
+    "node": "origin",
+    "reply": {
+      "result": {
+        "step": "none"
+      }
+    },
+    "request": {
+      "method": "agent_data.status",
+      "params": {
+        "cutId": "11111111111111111111111111111111",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "diverged-advanced",
+    "node": "origin",
+    "reply": {
+      "result": {
+        "refs": [
+          {
+            "state": "advanced"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.diverged",
+      "params": {
+        "cutId": "11111111111111111111111111111111",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "busy-in-flight",
+    "node": "origin",
+    "reply": {
+      "result": {
+        "refs": [
+          {
+            "reason": "head work is in flight",
+            "reason_code": "send_queued",
+            "state": "busy"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.busy",
+      "params": {
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "prepare-busy",
+    "node": "origin",
+    "reply": {
+      "error": {
+        "code": "busy",
+        "detail": {
+          "refs": [
+            {
+              "reason": "Agent head can't move right now: ask_answer_in_flight. Try again once that finishes.",
+              "reason_code": "ask_answer_in_flight",
+              "ref": "head",
+              "ref_kind": "prefrontal-agent"
+            }
+          ]
+        },
+        "message": "agent cannot move now"
+      }
+    },
+    "request": {
+      "method": "agent_data.prepare",
+      "params": {
+        "cutId": "11111111111111111111111111111111",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "prepare-before-abort",
+    "node": "origin",
+    "reply": {
+      "result": {
+        "external": [],
+        "items": [
+          {
+            "digest": "7f5a0bedaae96e2355b1ad292e6105b970038d939fd8e44bbcf58c22cb3412c6",
+            "endOffset": 2219,
+            "format": "prefrontal-agent/1",
+            "frozen": true,
+            "ref": "head",
+            "ref_kind": "prefrontal-agent",
+            "sessionRef": "09593d613fe7b39fdd17f076d1d228e6",
+            "stream": "reserved:prefrontal"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.prepare",
+      "params": {
+        "cutId": "22222222222222222222222222222222",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "abort",
+    "node": "origin",
+    "reply": {
+      "result": {}
+    },
+    "request": {
+      "method": "agent_data.abort",
+      "params": {
+        "cutId": "22222222222222222222222222222222",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "status-aborted",
+    "node": "origin",
+    "reply": {
+      "result": {
+        "step": "aborted"
+      }
+    },
+    "request": {
+      "method": "agent_data.status",
+      "params": {
+        "cutId": "22222222222222222222222222222222",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "prepare",
+    "node": "origin",
+    "reply": {
+      "result": {
+        "external": [],
+        "items": [
+          {
+            "digest": "d16fb54896fa3cfc24b0f4c49e5effc0ae3dc02ef1a6b8dcd88fd1f442645b06",
+            "endOffset": 2219,
+            "format": "prefrontal-agent/1",
+            "frozen": true,
+            "ref": "head",
+            "ref_kind": "prefrontal-agent",
+            "sessionRef": "f76687d84c4d615535ad3848e9e9754b",
+            "stream": "reserved:prefrontal"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.prepare",
+      "params": {
+        "cutId": "11111111111111111111111111111111",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "status-prepared",
+    "node": "origin",
+    "reply": {
+      "result": {
+        "step": "prepared"
+      }
+    },
+    "request": {
+      "method": "agent_data.status",
+      "params": {
+        "cutId": "11111111111111111111111111111111",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "diverged-at-cut",
+    "node": "origin",
+    "reply": {
+      "result": {
+        "refs": [
+          {
+            "state": "at_cut"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.diverged",
+      "params": {
+        "cutId": "11111111111111111111111111111111",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "export",
+    "node": "origin",
+    "reply": {
+      "result": {
+        "items": [
+          {
+            "endOffset": 2219,
+            "sessionRef": "f76687d84c4d615535ad3848e9e9754b"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.export",
+      "params": {
+        "cutId": "11111111111111111111111111111111",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "import",
+    "node": "destination",
+    "reply": {
+      "result": {
+        "items": [
+          {
+            "digest": "d16fb54896fa3cfc24b0f4c49e5effc0ae3dc02ef1a6b8dcd88fd1f442645b06",
+            "endOffset": 2219,
+            "sessionRef": "f76687d84c4d615535ad3848e9e9754b"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.import",
+      "params": {
+        "cutId": "11111111111111111111111111111111",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "status-imported",
+    "node": "destination",
+    "reply": {
+      "result": {
+        "step": "imported"
+      }
+    },
+    "request": {
+      "method": "agent_data.status",
+      "params": {
+        "cutId": "11111111111111111111111111111111",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "activate",
+    "node": "destination",
+    "reply": {
+      "result": {}
+    },
+    "request": {
+      "method": "agent_data.activate",
+      "params": {
+        "cutId": "11111111111111111111111111111111",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "status-activated",
+    "node": "destination",
+    "reply": {
+      "result": {
+        "step": "activated"
+      }
+    },
+    "request": {
+      "method": "agent_data.status",
+      "params": {
+        "cutId": "11111111111111111111111111111111",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "release",
+    "node": "origin",
+    "reply": {
+      "result": {
+        "enforced": true
+      }
+    },
+    "request": {
+      "method": "agent_data.release",
+      "params": {
+        "cutId": "11111111111111111111111111111111",
+        "holder": "other-computer",
+        "holderBox": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "status-released",
+    "node": "origin",
+    "reply": {
+      "result": {
+        "step": "released"
+      }
+    },
+    "request": {
+      "method": "agent_data.status",
+      "params": {
+        "cutId": "11111111111111111111111111111111",
+        "refs": [
+          {
+            "ref": "head",
+            "ref_kind": "prefrontal-agent"
+          }
+        ]
+      }
+    }
+  }
+]

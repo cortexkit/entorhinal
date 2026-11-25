@@ -129,6 +129,8 @@ mod user_profile;
 // Participant calls are invoked by the move driver, not at module startup.
 #[allow(dead_code)]
 mod participant_client;
+#[cfg(test)]
+mod participant_client_prefrontal_samples_tests;
 // The move driver uses discovery on admission, not at module startup.
 #[allow(dead_code)]
 mod participant_discovery;
