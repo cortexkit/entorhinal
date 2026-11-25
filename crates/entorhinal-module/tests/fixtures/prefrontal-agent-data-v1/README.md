@@ -10,14 +10,20 @@ activated, and released. The prepare, export, and import replies for `1111…`
 refer to the same stream. `prepare-busy` is captured while the origin is writing
 an ask answer, before the cut is prepared.
 
-`requests/` holds the copied Entorhinal driver captures from source revision
-`e0d0ec8`, including the release form with
-`holderBox`. The Rust test decodes the 14 participant requests per file with
-`cortexkit-role-agent-data` 0.3.4 and checks that encoding preserves their
-parameters, including the exact session refs. The two preceding registry calls
-in each file are retained for provenance; they are not participant operations.
+Prefrontal is a required participant: `describe` omits `optional` because
+Prefrontal runs on every computer an agent can move to. If Prefrontal has data
+to carry and is missing on the destination, the move aborts. Do not mark
+Prefrontal optional. Entorhinal sends `ref_kind: "agent"` with the agent ID;
+`prefrontal-agent` names the store, not a reference kind.
+
+`requests/` holds driver captures from the Entorhinal repository at `e0d0ec8`,
+including the release form with `holderBox`. The Rust test decodes the 14
+participant requests per file with `cortexkit-role-agent-data` 0.3.4 and checks
+that encoding preserves their parameters, including the exact session refs. The
+two preceding registry calls in each file are retained for provenance; they are
+not participant operations.
 The copied requests use `opencode-session`; Prefrontal's own reply samples use
-`prefrontal-agent`.
+the whole-agent `agent` ref kind.
 
 From the repository root, check the files with:
 

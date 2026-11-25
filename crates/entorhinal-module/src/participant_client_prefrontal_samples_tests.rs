@@ -24,9 +24,9 @@ use crate::participant_discovery::Participant;
 
 const MODULE: &str = "prefrontal";
 
-const SUMS_SHA256: &str = "523e8b7d6c2a3d5f16339db619121ccd112d337791f21d8853ecb044cb56ddb6";
+const SUMS_SHA256: &str = "295e44df026b96029162bd4cf3cc002b0adc14ae8bb041509e0e734ab5aa3f19";
 // The published checksum list does not cover its README.
-const README_SHA256: &str = "8e4254ec3652b8dca3b59c119bcc20f4ef9d8886a28b6b3eade0d6a4eece8bcb";
+const README_SHA256: &str = "2a15601b79293bde77c4717eb314d660397e8ad98d90d781fc7c20576ddcb4dc";
 
 fn samples_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prefrontal-agent-data-v1")
@@ -240,7 +240,7 @@ async fn prefrontal_agent_data_samples_describe_plans_required_head() {
     let SampleReply::Result(published) = &sample.reply else {
         panic!("describe sample must succeed");
     };
-    let head = AgentRef::new("prefrontal-agent", "head");
+    let head = AgentRef::new("agent", "head");
     // Advertising Prefrontal is not enough to synthesize a head ref. Routing
     // delivers only refs actually supplied to the planner.
     for refs in [&[][..], std::slice::from_ref(&head)] {
@@ -251,7 +251,34 @@ async fn prefrontal_agent_data_samples_describe_plans_required_head() {
         let entry = &plan[0];
         assert_eq!(entry.client.module_id, MODULE);
         assert!(!entry.description.optional, "Prefrontal is required");
-        assert_eq!(entry.description.ref_kinds, ["prefrontal-agent"]);
+        assert_eq!(entry.description.ref_kinds, ["agent"]);
         assert_eq!(entry.refs, refs);
     }
+}
+
+#[tokio::test]
+async fn prefrontal_agent_data_samples_admission_adds_required_agent_ref() {
+    let samples = read_samples();
+    let sample = samples
+        .iter()
+        .find(|sample| sample.request.method == DESCRIBE)
+        .expect("published describe sample");
+    let SampleReply::Result(published) = &sample.reply else {
+        panic!("describe sample must succeed");
+    };
+    let agent_id = "head".to_owned();
+    let (participant, _) = sample_participant(sample, Ok(result_envelope(published)));
+    let described = describe_participants(&[participant]).await.unwrap();
+    let mut wire_refs = Vec::new();
+    let carries_agent = described
+        .iter()
+        .any(|p| p.description.ref_kinds.iter().any(|kind| kind == "agent"));
+    if carries_agent {
+        wire_refs.push(AgentRef::new("agent", agent_id.clone()));
+    }
+    let plan = plan_participants(described, &wire_refs).unwrap();
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].client.module_id, MODULE);
+    assert!(!plan[0].description.optional, "Prefrontal is required");
+    assert_eq!(plan[0].refs, [AgentRef::new("agent", agent_id)]);
 }

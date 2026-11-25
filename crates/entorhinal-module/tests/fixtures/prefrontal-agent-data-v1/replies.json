@@ -6,7 +6,7 @@
       "result": {
         "external": false,
         "ref_kinds": [
-          "prefrontal-agent"
+          "agent"
         ],
         "stores": [
           {
@@ -39,7 +39,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -60,7 +60,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -85,7 +85,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -111,7 +111,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -129,7 +129,7 @@
               "reason": "Agent head can't move right now: ask_answer_in_flight. Try again once that finishes.",
               "reason_code": "ask_answer_in_flight",
               "ref": "head",
-              "ref_kind": "prefrontal-agent"
+              "ref_kind": "agent"
             }
           ]
         },
@@ -143,7 +143,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -162,7 +162,7 @@
             "format": "prefrontal-agent/1",
             "frozen": true,
             "ref": "head",
-            "ref_kind": "prefrontal-agent",
+            "ref_kind": "agent",
             "sessionRef": "09593d613fe7b39fdd17f076d1d228e6",
             "stream": "reserved:prefrontal"
           }
@@ -176,7 +176,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -195,7 +195,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -216,7 +216,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -235,7 +235,7 @@
             "format": "prefrontal-agent/1",
             "frozen": true,
             "ref": "head",
-            "ref_kind": "prefrontal-agent",
+            "ref_kind": "agent",
             "sessionRef": "f76687d84c4d615535ad3848e9e9754b",
             "stream": "reserved:prefrontal"
           }
@@ -249,7 +249,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -270,7 +270,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -295,7 +295,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -321,7 +321,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -348,7 +348,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -369,7 +369,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -388,7 +388,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -409,7 +409,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -432,7 +432,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
@@ -453,7 +453,7 @@
         "refs": [
           {
             "ref": "head",
-            "ref_kind": "prefrontal-agent"
+            "ref_kind": "agent"
           }
         ]
       }
