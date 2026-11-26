@@ -1,5 +1,10 @@
 # entorhinal
 
+> [!WARNING]
+> **Alpha.** entorhinal is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 entorhinal is the project and agent registry for
 [CortexKit](https://github.com/cortexkit/subconscious). It gives every project
 a durable id (`pj-…`) and answers which project a directory belongs to, so

@@ -1,5 +1,10 @@
 # entorhinal-catalog
 
+> [!WARNING]
+> **Alpha.** entorhinal-catalog is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 A pure Rust implementation of CK catalog v1. The caller supplies bytes, the
 scope's trusted publisher keys, registry-attested publication time, pinned
 registry status-key chain and held state. This crate has no I/O, runtime,
