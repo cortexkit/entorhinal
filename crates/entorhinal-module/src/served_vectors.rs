@@ -1566,18 +1566,29 @@ async fn project_resolve_v1_records_roundtrip_through_project_identity() {
             request.unwrap_or_else(|error| panic!("{label}: request decode failed: {error}"));
         }
 
-        let reply = &record["reply"];
+        let mut reply = record["reply"].clone();
+        if let Some(workspaces) = reply
+            .pointer_mut("/result/workspaces")
+            .and_then(Value::as_array_mut)
+        {
+            // The published project-identity crate decodes but ignores workspace
+            // approval until it has a typed field for it. The served vector tests
+            // compare the full reply bytes; check the reader's existing fields here.
+            for workspace in workspaces {
+                workspace.as_object_mut().unwrap().remove("approval");
+            }
+        }
         let decoded: pid::Outcome<R> = serde_json::from_value(reply.clone())
             .unwrap_or_else(|error| panic!("{label}: reply decode failed: {error}; reply={reply}"));
         let encoded = serde_json::to_value(decoded)
             .unwrap_or_else(|error| panic!("{label}: reply encode failed: {error}"));
         let mut changes = Vec::new();
-        changed_members(reply, &encoded, "", &mut changes);
+        changed_members(&reply, &encoded, "", &mut changes);
         // Value equality preserves member presence, including null versus absent,
         // without depending on object key order or platform-specific JSON bytes.
         assert_eq!(
             reply,
-            &encoded,
+            encoded,
             "{label}: project-identity round trip changed members:\n{}",
             changes.join("\n")
         );
@@ -2263,11 +2274,17 @@ async fn project_enumerate_file_ids_records() -> Vec<String> {
         reply.get("result").is_some(),
         "fixture assignment failed: {reply}"
     );
+    // Seed a historical workspace root with no approval.
     fixture
-        .handler
-        .set_workspace_root(
-            json!({"workspaceId":"ws-file-ids","root":workspace}),
-            "direct",
+        .store()
+        .with_principal("direct")
+        .set_workspace_root_at(
+            entorhinal_core::SetWorkspaceRootRequest {
+                workspace_id: "ws-file-ids".into(),
+                root: Some(workspace.clone()),
+                ..Default::default()
+            },
+            700,
         )
         .unwrap();
     std::fs::write(
@@ -2332,6 +2349,105 @@ async fn project_enumerate_file_ids_records() -> Vec<String> {
         &[],
         &reply,
     )]
+}
+
+#[tokio::test]
+async fn project_enumerate_workspace_approval_records_match_published_file() {
+    const DIRECT: RouteKey = (908, 1);
+    let mut fixture = SessionFixture::new("workspace-approval-vector").await;
+    fixture.handler.operator_confirmer = std::sync::Arc::new(Approve {
+        summaries: std::sync::Mutex::new(Vec::new()),
+    });
+    fixture.handler.route_admissions().insert(
+        DIRECT,
+        RouteAdmission::from_bind(Some(Principal::Direct), None),
+    );
+    let fixture_root = crate::tests::canonical_test_path(&fixture.dir);
+    let store = fixture.store();
+    let writer = store.with_principal("direct");
+    let mut paths = Vec::new();
+    let mut replaced_id = None;
+    for (id, name) in [
+        ("approved", "Approved"),
+        ("replaced", "Replaced"),
+        ("unapproved", "Unapproved"),
+    ] {
+        writer
+            .create_workspace_at(
+                entorhinal_core::CreateWorkspaceRequest {
+                    workspace_id: id.into(),
+                    name: name.into(),
+                },
+                700,
+            )
+            .unwrap();
+        let path = fixture_root.join(id);
+        std::fs::create_dir(&path).unwrap();
+        let root = path.to_str().unwrap();
+        if id == "unapproved" {
+            writer
+                .set_workspace_root_at(
+                    entorhinal_core::SetWorkspaceRootRequest {
+                        workspace_id: id.into(),
+                        root: Some(root.into()),
+                        ..Default::default()
+                    },
+                    700,
+                )
+                .unwrap();
+        } else {
+            let (_, reply) = fixture
+                .record(
+                    DIRECT,
+                    "direct",
+                    "set_workspace_root",
+                    json!({"workspaceId":id,"root":root}),
+                )
+                .await;
+            assert_eq!(reply["result"]["approval"]["state"], "approved", "{reply}");
+            if id == "replaced" {
+                replaced_id = Some(expected_file_id(&path));
+                std::fs::rename(&path, fixture_root.join("original")).unwrap();
+                std::fs::create_dir(&path).unwrap();
+            }
+        }
+        paths.push((root.to_owned(), format!("/fixture/{id}")));
+    }
+    let (mut record, reply) = fixture
+        .record(SESSION_READER, READER_MODULE, "enumerate", json!({}))
+        .await;
+    serde_json::from_value::<pid::Outcome<pid::EnumerateReply>>(reply.clone())
+        .expect("the published reader accepts workspace approval as an additive field");
+    let workspaces = reply["result"]["workspaces"].as_array().unwrap();
+    assert_eq!(workspaces.len(), 3);
+    for (index, (workspace, (root, _))) in workspaces.iter().zip(&paths).enumerate() {
+        let file_id = expected_file_id(Path::new(root));
+        assert_eq!(workspace["fileId"], file_id);
+        if index == 1 {
+            assert_ne!(replaced_id.as_deref(), Some(file_id.as_str()));
+        }
+        let expected = if index == 0 {
+            json!({"state":"approved","journalSeq":2})
+        } else {
+            json!({"state":"unapproved","journalSeq":null})
+        };
+        assert_eq!(workspace["approval"], expected);
+        record = record.replace(
+            &json_string_contents(&file_id),
+            &format!("unix:1:{}", 100 + index),
+        );
+    }
+    published_file(
+        "project-resolve-v1",
+        "enumerate-workspace-approval.json",
+        vec![normalize_project_record(
+            record,
+            fixture_root.to_str().unwrap(),
+            &paths,
+            &[],
+            &reply,
+        )],
+    );
 }
 
 /// The daemon's `projects.enumerate` control op must answer exactly what a

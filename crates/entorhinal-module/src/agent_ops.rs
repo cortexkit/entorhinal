@@ -1370,11 +1370,15 @@ pub(crate) mod tests {
                             | "register"
                             | "attach_root"
                             | "add_root"
+                            | crate::workspace_approval::APPROVE
                     );
                     let direct_only = confirmed_folder_write
                         || matches!(
                             *method,
-                            "unapprove_root" | "unapprove_project" | "set_workspace_root"
+                            "unapprove_root"
+                                | "unapprove_project"
+                                | "set_workspace_root"
+                                | crate::workspace_approval::UNAPPROVE
                         )
                         || *method == crate::store_origin::ADOPT
                         || *method == "placement.backfill"

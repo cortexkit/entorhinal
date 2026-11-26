@@ -438,9 +438,11 @@ usage: ck workspaces <verb> [args] [--subc <connection file>] [--json]
   list                    workspaces known to the registry
   assign <project-id> <workspace-id>
                           put a project in a workspace (moves it if already in another)
-  set-root <workspace> <directory>
-                          record the workspace's root directory
+  root <workspace> <directory>  (also set-root)
+                          set and approve the root with operator confirmation
   clear-root <workspace>  remove the recorded root
+  approve <workspace>     approve its current root with operator confirmation
+  unapprove <workspace>   revoke approval without clearing the root
   document show <workspace> [--revision N]
                            read an accepted workspace document
   document set <workspace> [--charter-file PATH] [--document-file PATH] [--yes]
@@ -501,7 +503,7 @@ surface is:
 
    ck projects      list, register, resolve, remove, add-root, remove-root, move-root,
                    refresh-key, attach, owned-remotes, approve, unapprove, trust, verify, log
-  ck workspaces    list, assign, set-root, clear-root
+  ck workspaces    list, assign, root, clear-root, approve, unapprove
    ck agents        create, rename, retire, tag, labels, list, show
    ck roles         read, take
 
@@ -912,7 +914,7 @@ fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
                 "actor": actor,
             }),
         ),
-        (Face::Workspaces, "set-root") => (
+        (Face::Workspaces, "root" | "set-root") => (
             "set_workspace_root".to_string(),
             json!({
                 "workspaceId": need(0, "a workspace id")?,
@@ -927,6 +929,15 @@ fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
                 "root": null,
                 "actor": actor,
             }),
+        ),
+        (Face::Workspaces, verb @ ("approve" | "unapprove")) => (
+            if verb == "approve" {
+                entorhinal_core::workspace_approval::APPROVE
+            } else {
+                entorhinal_core::workspace_approval::UNAPPROVE
+            }
+            .into(),
+            json!({"workspaceId": need(0, "a workspace id")?}),
         ),
         // The old spelling teaches its replacement instead of guessing at it:
         // `workspace` as a projects-verb was the pre-rename surface.
@@ -1673,7 +1684,7 @@ fn call(
                     | "project.set_domain"
                     | "workspace.set_document"
                     | "placement.backfill"
-            ) || super::CONFIRMED_FOLDER_WRITES.contains(&method)
+            ) || super::requires_folder_confirmation(method, &params)
                 || super::catalog_ops::WRITES.contains(&method)
                 || method == super::catalog_publish::PUBLISH
             {
@@ -1752,6 +1763,7 @@ fn placement_call_options(method: &str) -> subc_client_rs::CallOptions {
             | "project.set_domain"
             | "workspace.set_document"
             | "move_root_to_new_project"
+            | "set_workspace_root"
     ) || super::CONFIRMED_FOLDER_WRITES.contains(&method)
     {
         return subc_client_rs::CallOptions {
@@ -1810,6 +1822,22 @@ fn unwrap_result(envelope: Value) -> Result<Value, (u8, String)> {
     }
 }
 
+fn format_workspace_root(value: &Value) -> String {
+    let workspace = text(&value["workspaceId"]);
+    let Some(root) = value["root"].as_str() else {
+        return format!("Workspace {workspace} has no root.");
+    };
+    let outcome = match value["approval"]["state"].as_str() {
+        Some("approved") => "approved",
+        Some("unapproved") if value["unapprovedReason"] == "file_id_unavailable" => {
+            "unapproved (the folder's file identity could not be read)"
+        }
+        Some("unapproved") => "unapproved",
+        _ => "approval not reported",
+    };
+    format!("Workspace {workspace} root {root}: {outcome}.")
+}
+
 fn render(command: &Command, value: &Value) {
     if command.face == Face::Workspaces && command.verb == "document" && !command.json {
         if value["preview"] == true {
@@ -1832,6 +1860,9 @@ fn render(command: &Command, value: &Value) {
         (Face::Agents, "list" | "show") => println!("{}", format_agents(&command.verb, value)),
         (Face::Agents, "moves") => println!("{}", format_agent_moves(value)),
         (Face::Agents, "avatars") => println!("{}", format_avatar_manifest(value)),
+        (Face::Workspaces, "root" | "set-root" | "clear-root" | "approve" | "unapprove") => {
+            println!("{}", format_workspace_root(value));
+        }
         (Face::Workspaces, "list") => {
             let workspaces = value["workspaces"].as_array().cloned().unwrap_or_default();
             if workspaces.is_empty() {
@@ -2635,6 +2666,19 @@ mod tests {
         assert_eq!(method, "set_workspace_root");
         assert_eq!(params["workspaceId"], "w1");
         assert_eq!(params["root"], canonical.to_string_lossy().as_ref());
+        assert_eq!(
+            build(&ws(&["root", "w1", dir.to_str().unwrap()])).unwrap(),
+            (method, params)
+        );
+        for (verb, expected) in [
+            ("approve", "approve_workspace_root"),
+            ("unapprove", "unapprove_workspace_root"),
+        ] {
+            assert_eq!(
+                build(&ws(&[verb, "w1"])).unwrap(),
+                (expected.into(), json!({"workspaceId":"w1"}))
+            );
+        }
         let (method, params) = build(&ws(&["clear-root", "w1"])).unwrap();
         assert_eq!(method, "set_workspace_root");
         assert!(

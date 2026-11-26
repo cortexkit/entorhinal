@@ -1141,19 +1141,7 @@ impl super::JournalWriter<'_> {
         // filesystem, and the journal must record exactly the value the
         // projection holds so `rebuild` reproduces it without re-reading disk.
         if let Some(root) = req.root.as_deref() {
-            if !Path::new(root).is_absolute() {
-                return Err(domain(
-                    "not_absolute",
-                    format!("workspace root must be an absolute path: {root}"),
-                ));
-            }
-            canonical(root)?;
-            if !Path::new(root).is_dir() {
-                return Err(domain(
-                    "not_a_directory",
-                    format!("workspace root is not a directory: {root}"),
-                ));
-            }
+            crate::workspace_approval::validate_root(root)?;
         }
         let key = req.request_key.clone();
         let actor = req.actor.clone().unwrap_or_else(|| "module".into());
@@ -1708,6 +1696,7 @@ pub(crate) const DERIVED_TABLES: &[&str] = &[
     "project_root_key",
     "project_root",
     "project",
+    "workspace_root_approval",
     "workspace_root",
     "workspace",
     "root_binding",
@@ -1720,7 +1709,7 @@ pub(crate) const DERIVED_TABLES: &[&str] = &[
 // `workspace.updated_at`, as it did when the path lived on the workspace row.
 // Replay calls this same function, so a rebuilt store matches the live one,
 // including a cleared path keeping the time it was cleared.
-fn set_workspace_root_projection(
+pub(crate) fn set_workspace_root_projection(
     tx: &Transaction<'_>,
     workspace_id: &str,
     root: Option<&str>,
@@ -2135,6 +2124,12 @@ fn replay(
             for p in r.derived_root_parents {
                 tx.execute("INSERT OR IGNORE INTO derived_root_parent(canonical_parent,project_id) VALUES(?1,?2)",params![p,id])?;
             }
+        }
+        crate::workspace_approval::APPROVE | crate::workspace_approval::UNAPPROVE => {
+            crate::workspace_approval::replay(tx, seq, v, now, enabled)?;
+        }
+        "set_workspace_root" if v.get("workspaceApproval").is_some() => {
+            crate::workspace_approval::replay(tx, seq, v, now, enabled)?;
         }
         // Mirrors the live `set_workspace_root`. The journal holds the value
         // that was validated when it was set, so replay never re-reads disk: a

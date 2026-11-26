@@ -31,6 +31,7 @@ pub mod claim_cache;
 pub mod context;
 pub mod folder_approval;
 mod memory;
+pub mod workspace_approval;
 pub use memory::{SetProjectDomainRequest, SetWorkspaceDocumentRequest, WorkspaceDocument};
 pub mod enable_state;
 pub mod hub_store;
@@ -239,7 +240,7 @@ ALTER TABLE identity_log_state DROP COLUMN hub_quieting;
 ALTER TABLE pending_entry DROP COLUMN continuation;
 "#;
 
-const MIGRATIONS: [Migration; 28] = [
+const MIGRATIONS: [Migration; 29] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -352,7 +353,14 @@ const MIGRATIONS: [Migration; 28] = [
         version: 28,
         statements: V28_REMOVE_ENGRAM_STATE,
     },
+    Migration {
+        version: 29,
+        statements: workspace_approval::V29_WORKSPACE_ROOT_APPROVAL,
+    },
 ];
+
+/// Latest registry schema version in this build.
+pub const SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
 
 /// A store opened from the descriptor resolved by subc.
 #[derive(Clone)]
@@ -699,36 +707,24 @@ impl RegistryStore {
         self.read_with_checkouts(&mut checkouts, |conn, checkouts| {
             let workspaces = if let Some(workspace_id) = workspace_id {
                 conn.query_row(
-                    "SELECT w.workspace_id, w.name, r.root FROM workspace w
+                    "SELECT w.workspace_id, w.name, r.root, a.file_id, a.journal_seq FROM workspace w
                      LEFT JOIN workspace_root r ON r.workspace_id=w.workspace_id
+                     LEFT JOIN workspace_root_approval a ON a.workspace_id=w.workspace_id AND a.root=r.root
                      WHERE w.workspace_id = ?1",
                     params![workspace_id],
-                    |row| {
-                        Ok(vec![WorkspaceSummary {
-                            workspace_id: row.get(0)?,
-                            name: row.get(1)?,
-                            root: row.get(2)?,
-                            file_id: None,
-                        }])
-                    },
+                    |row| Ok(vec![WorkspaceSummary::from_row(row)?]),
                 )
                 .optional()?
                 .unwrap_or_default()
             } else {
                 let mut statement = conn.prepare(
-                    "SELECT w.workspace_id, w.name, r.root FROM workspace w
+                    "SELECT w.workspace_id, w.name, r.root, a.file_id, a.journal_seq FROM workspace w
                      LEFT JOIN workspace_root r ON r.workspace_id=w.workspace_id
+                     LEFT JOIN workspace_root_approval a ON a.workspace_id=w.workspace_id AND a.root=r.root
                      ORDER BY w.workspace_id",
                 )?;
                 let rows = statement
-                    .query_map([], |row| {
-                        Ok(WorkspaceSummary {
-                            workspace_id: row.get(0)?,
-                            name: row.get(1)?,
-                            root: row.get(2)?,
-                            file_id: None,
-                        })
-                    })?
+                    .query_map([], WorkspaceSummary::from_row)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 rows
             };
@@ -833,13 +829,16 @@ impl RegistryStore {
                 "SELECT seq, op, payload_json, actor, request_key, created_at, principal
                  FROM registry_journal
                   WHERE seq > ?1 AND op NOT IN ({}, '{}', '{}', 'user.set', 'store.adopt',
-                    'log.migrated', 'hub.snapshot', 'hub.local_write', 'member.set_box', 'member.key', 'member.removed', 'member.admitted')
+                     'log.migrated', 'hub.snapshot', 'hub.local_write', 'member.set_box', 'member.key', 'member.removed', 'member.admitted', '{}', '{}')
+                    AND (op != 'set_workspace_root' OR json_type(payload_json, '$.workspaceApproval') IS NULL)
                  ORDER BY seq
                  LIMIT ?2",
                 agent::change_ops_sql(),
                 agent::IDENTITY_MARKER_OP,
                 // An agent's catalog pins are agent state, not project history.
                 catalog_agent::PIN_OP,
+                workspace_approval::APPROVE,
+                workspace_approval::UNAPPROVE,
             ))?;
             let entries = statement
                 .query_map(params![after_seq, limit], |row| {
@@ -1645,6 +1644,33 @@ pub struct WorkspaceSummary {
     /// [`file_id`]. Omitted when there is no root or it cannot be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_id: Option<String>,
+    /// Local approval for the folder's current file identity. Omitted without a root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval: Option<Approval>,
+}
+
+impl WorkspaceSummary {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let root: Option<String> = row.get(2)?;
+        let approved_file: Option<String> = row.get(3)?;
+        let journal_seq: Option<i64> = row.get(4)?;
+        let file_id = root
+            .as_deref()
+            .and_then(workspace_approval::current_file_id);
+        let approval = root.as_ref().map(|_| {
+            // Use the same filesystem observation for fileId and approval.
+            workspace_approval::approval(
+                journal_seq.filter(|_| file_id.is_some() && file_id == approved_file),
+            )
+        });
+        Ok(Self {
+            workspace_id: row.get(0)?,
+            name: row.get(1)?,
+            root,
+            file_id,
+            approval,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1980,18 +2006,9 @@ pub fn file_id(_path: &Path) -> Option<String> {
     None
 }
 
-/// Stamp every local root and workspace root in an `enumerate` reply with its
-/// file identity. The served `enumerate` operation calls this, so only that
-/// reply carries it: the daemon reads it there to notice a folder swapped under
-/// an unchanged path, and `resolve`, on every worker launch's path, stays as it
-/// was. Store-level reads leave it out, so their committed golden replies hold.
+/// Stamp the project root records in a served `enumerate` reply with their file
+/// identities. Workspace roots already carry the identity used to check approval.
 pub fn fill_file_ids(reply: &mut EnumerateReply) {
-    for workspace in &mut reply.workspaces {
-        workspace.file_id = workspace
-            .root
-            .as_deref()
-            .and_then(|root| file_id(Path::new(root)));
-    }
     for project in &mut reply.projects {
         for record in project.root_records.iter_mut().flatten() {
             record.file_id = file_id(Path::new(&record.root));

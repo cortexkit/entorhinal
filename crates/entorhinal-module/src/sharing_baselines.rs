@@ -49,6 +49,7 @@ const DERIVED: &[&str] = &[
     "project_root_key",
     "project_root",
     "project",
+    "workspace_root_approval",
     "workspace_root",
     "workspace",
     "root_binding",
@@ -210,8 +211,12 @@ fn rebuild_prefixes(source: &Path) -> String {
             .unwrap();
         file.open().rebuild().unwrap();
         let conn = file.read();
+        // These prefixes predate workspace approval. Check the new table is
+        // empty without changing the captured bytes for the older tables.
+        assert!(rows(&conn, "SELECT * FROM workspace_root_approval").is_empty());
         let tables: serde_json::Map<String, Value> = DERIVED
             .iter()
+            .filter(|&&table| table != "workspace_root_approval")
             .map(|table| {
                 let mut data = rows(&conn, &format!("SELECT * FROM {table}"));
                 data.sort_by_cached_key(|row| serde_json::to_string(row).unwrap());
@@ -360,7 +365,7 @@ pub(crate) fn check_store(file: &StoreFile, store: &RegistryStore, state: &str, 
     let verify = store.verify().unwrap();
     assert!(verify.ok, "{verify:?}");
     let conn = file.read();
-    assert_schema_version(&conn, 28);
+    assert_schema_version(&conn, i64::from(entorhinal_core::SCHEMA_VERSION));
     assert_eq!(
         rows(&conn, "SELECT COUNT(*) FROM identity_log_state"),
         vec![vec![json!(1)]]
@@ -517,6 +522,25 @@ fn migrate_history(file: &StoreFile, name: &str) -> RegistryStore {
     let store = file.open();
     let conn = file.read();
     let mut after_schema = schema(&conn);
+    // Workspace approvals add these three objects without modifying any old
+    // table or approving roots from the captured store.
+    let count = after_schema.len();
+    after_schema.retain(|item| {
+        !matches!(
+            item[1].as_str(),
+            Some(
+                "workspace_root_approval"
+                    | "sqlite_autoindex_workspace_root_approval_1"
+                    | "clear_workspace_root_approval"
+            )
+        )
+    });
+    assert_eq!(
+        count - after_schema.len(),
+        3,
+        "{name}: workspace approval schema"
+    );
+    assert!(rows(&conn, "SELECT * FROM workspace_root_approval").is_empty());
     // SQLite rewrites these two CREATE TABLE texts. Compare their retained
     // columns below, but compare every other schema object byte-for-byte.
     for items in [&mut expected_schema, &mut after_schema] {
@@ -544,8 +568,18 @@ fn migrate_history(file: &StoreFile, name: &str) -> RegistryStore {
         let mut actual = projection(&conn, &table, &columns);
         if table == "cortexkit_schema_version" {
             let count = actual.len();
-            actual.retain(|row| !(row[0] == "projects" && row[1] == 28));
-            assert_eq!(count - actual.len(), 1, "{name}: new migration row");
+            let latest = i64::from(entorhinal_core::SCHEMA_VERSION);
+            actual.retain(|row| {
+                !(row[0] == "projects"
+                    && row[1]
+                        .as_i64()
+                        .is_some_and(|version| (28..=latest).contains(&version)))
+            });
+            assert_eq!(
+                count - actual.len(),
+                (latest - 27) as usize,
+                "{name}: new migration rows"
+            );
         }
         assert_eq!(actual, data, "{name}: {table} rows");
     }

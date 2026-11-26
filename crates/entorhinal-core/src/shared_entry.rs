@@ -722,6 +722,7 @@ mod tests {
                     "root_approval",
                     "root_owned_remotes",
                     "workspace_root",
+                    "workspace_root_approval",
                     "identity_log_state",
                     "pending_entry",
                     "cortexkit_schema_version",

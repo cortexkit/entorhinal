@@ -161,6 +161,7 @@ before the module was named entorhinal; changing it would re-run migration 1).
 | 11 | Catalog registry trust, held status, publisher grants and audit. |
 | 12 | Shared catalog pin sets and pins; local plans, generations and transition receipts (the recorded result of each applied plan or generation transition). |
 | 18 | Shared user profile and scoped expertise, scope-deletion triggers, and local user request receipts. |
+| 29 | Machine-local, journal-derived workspace root approvals tied to the folder's filesystem identity. Existing roots remain unapproved. |
 
 Migration 17 adds nullable `session_binding.held_on TEXT` (null for existing
 and locally created rows) and a partial index ordered by
