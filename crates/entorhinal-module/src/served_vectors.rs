@@ -86,7 +86,15 @@ impl Fixture {
         // A rootless project is valid. Its fleet placement has no canonicalRoot,
         // so scratch paths and Windows drive letters never enter the records.
         fixture.handler.seed_project(json!({"projectId":"served-project","name":"Served project","roots":[],"workspaceId":"served-workspace"}), "direct").unwrap();
+        fixture.settle_startup_jobs().await;
         fixture
+    }
+
+    // Installing a store starts blocking catalog jobs that hold a store handle.
+    // Drop cannot await them, and Windows cannot delete the scratch folder while
+    // one is still open, so every fixture lets them finish before the test runs.
+    async fn settle_startup_jobs(&self) {
+        self.handler.catalog_sql.wait().await;
     }
 
     fn empty(label: &str, confirmer: std::sync::Arc<Approve>) -> Self {
@@ -173,7 +181,10 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         // Release SQLite and the lease before removing files on Windows.
         self.handler.store.lock().unwrap().take();
-        std::fs::remove_dir_all(&self.dir).unwrap();
+        // A panic here during an unwinding test would abort the whole runner.
+        if let Err(error) = std::fs::remove_dir_all(&self.dir) {
+            eprintln!("scratch folder {} not removed: {error}", self.dir.display());
+        }
     }
 }
 
@@ -5699,6 +5710,7 @@ async fn served_vectors_placement_facts_v1() {
             summaries: std::sync::Mutex::new(vec![]),
         }),
     );
+    f.settle_startup_jobs().await;
     let mut records = vec![f.record("placement.read", json!({})).await.0];
     let store = f.handler.with_store(|s| Ok(s.clone())).unwrap();
     store
