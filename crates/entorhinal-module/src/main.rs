@@ -23,6 +23,7 @@ use cortexkit_store_types::StorageDescriptor;
 #[cfg(test)]
 use cortexkit_store_types::{Isolation, StorageBackend};
 use entorhinal_core::{
+    workspace_approval::{self, WorkspaceApprovalRequest},
     AssignWorkspaceRequest, RegistryError, RegistryStore, RemoveRequest, SeedImportRequest,
     SetWorkspaceRootRequest, UpgradeImplicitRequest,
 };
@@ -741,6 +742,8 @@ const MUTATING_METHODS: &[&str] = &[
     "register",
     "assign_workspace",
     "set_workspace_root",
+    workspace_approval::APPROVE,
+    workspace_approval::UNAPPROVE,
     "set_owned_remotes",
     "upgrade_implicit",
     "remove",
@@ -824,7 +827,14 @@ const CONFIRMED_FOLDER_WRITES: &[&str] = &[
     "register",
     "attach_root",
     "add_root",
+    workspace_approval::APPROVE,
 ];
+
+fn requires_folder_confirmation(method: &str, params: &Value) -> bool {
+    CONFIRMED_FOLDER_WRITES.contains(&method)
+        || (method == "set_workspace_root"
+            && params.get("root").is_some_and(|root| !root.is_null()))
+}
 
 /// Admit most project and workspace mutations from the operator (`Direct`)
 /// or executive, but unconfirmed identity mutations only from the
@@ -878,7 +888,10 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
     if CONFIRMED_FOLDER_WRITES.contains(&method)
         || matches!(
             method,
-            "unapprove_root" | "unapprove_project" | "set_workspace_root"
+            "unapprove_root"
+                | "unapprove_project"
+                | "set_workspace_root"
+                | workspace_approval::UNAPPROVE
         )
     {
         return if matches!(principal, Some(Principal::Direct)) {
@@ -1801,6 +1814,9 @@ impl ProjectsHandler {
             "journal_tail" => self.journal_tail(request.params),
             "assign_workspace" => self.assign_workspace(request.params, &principal),
             "set_workspace_root" => self.set_workspace_root(request.params, &principal),
+            workspace_approval::UNAPPROVE => {
+                self.unapprove_workspace_root(request.params, &principal)
+            }
             "set_owned_remotes" => self.set_owned_remotes(request.params, &principal),
             "upgrade_implicit" => self.upgrade_implicit(request.params, &principal),
             "remove" => self.remove(request.params, &principal),
@@ -2068,9 +2084,28 @@ impl ProjectsHandler {
     fn set_workspace_root(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req =
             serde_json::from_value::<SetWorkspaceRootRequest>(params).map_err(invalid_params)?;
+        if req.root.is_some() {
+            return Err(HandlerError::new(
+                "operator_presence_unavailable",
+                "setting a workspace root requires the served operator confirmation path",
+            ));
+        }
         self.record_mutation(self.with_store(|s| {
             s.with_principal(principal)
                 .set_workspace_root_at(req, (self.clock)())
+        }))
+    }
+
+    fn unapprove_workspace_root(
+        &self,
+        params: Value,
+        principal: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let req: WorkspaceApprovalRequest =
+            serde_json::from_value(params).map_err(invalid_params)?;
+        self.record_mutation(self.with_store(|s| {
+            s.with_principal(principal)
+                .unapprove_workspace_root_at(req, (self.clock)())
         }))
     }
 
@@ -2500,7 +2535,17 @@ fn manifest() -> ModuleManifest {
                 management_operation(
                     "set_workspace_root",
                     ManagementOperationKind::Mutate,
-                    "Direct only: set or clear a workspace's root directory without approving it.",
+                    "Direct only: set and approve a workspace root with operator confirmation, or clear it without a prompt.",
+                ),
+                management_operation(
+                    workspace_approval::APPROVE,
+                    ManagementOperationKind::Mutate,
+                    "Direct only: approve the workspace's current root folder with operator confirmation.",
+                ),
+                management_operation(
+                    workspace_approval::UNAPPROVE,
+                    ManagementOperationKind::Mutate,
+                    "Direct only: revoke approval of the workspace root without a prompt.",
                 ),
                 management_operation(
                     "set_owned_remotes",
@@ -3356,7 +3401,10 @@ mod tests {
                 || CONFIRMED_FOLDER_WRITES.contains(method)
                 || matches!(
                     *method,
-                    "unapprove_root" | "unapprove_project" | "set_workspace_root"
+                    "unapprove_root"
+                        | "unapprove_project"
+                        | "set_workspace_root"
+                        | workspace_approval::UNAPPROVE
                 )
                 || *method == "move_root_to_new_project"
                 || *method == "identity_log.enable"
@@ -4321,12 +4369,13 @@ mod tests {
                 "assign_workspace",
                 json!({"projectId":"project", "workspaceId":"team", "workspaceName":"Team"}),
             );
-            execute_on(
+            served_on(
                 &handler,
                 key,
                 "set_workspace_root",
                 json!({"workspaceId":"team", "root":dir}),
-            );
+            )
+            .await;
             execute_on(
                 &handler,
                 key,
@@ -4410,10 +4459,11 @@ mod tests {
                     .collect::<Vec<_>>()
             );
 
+            let before_removals = handler.with_store(|s| s.generation()).unwrap();
             execute_on(&handler, key, "remove", json!({"workspaceId":"team"}));
             execute_on(&handler, key, "remove", json!({"projectId":"project"}));
             let removals = handler
-                .with_store(|s| s.journal_tail(19, 100))
+                .with_store(|s| s.journal_tail(before_removals, 100))
                 .unwrap()
                 .entries;
             assert_eq!(

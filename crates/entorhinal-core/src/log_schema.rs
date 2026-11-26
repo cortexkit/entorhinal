@@ -710,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn local_workspace_roots_feed_unchanged_resolve_and_enumerate_shapes() {
+    fn local_workspace_roots_keep_resolve_bytes_and_add_approval_to_enumerate() {
         let mut f = Fixture::new("log-schema-reads");
         let member = f.dir("member");
         let root = f.dir("workspace");
@@ -750,12 +750,12 @@ mod tests {
             for filter in [None, Some("W")] {
                 let listed = f.store.enumerate(filter).unwrap();
                 assert_eq!(
-                    serde_json::to_vec(&listed.workspaces).unwrap(),
-                    format!(
-                        r#"[{{"workspaceId":"W","name":"W","root":{}}}]"#,
-                        serde_json::to_string(&root).unwrap()
-                    )
-                    .into_bytes()
+                    serde_json::to_value(&listed.workspaces).unwrap(),
+                    json!([{
+                        "workspaceId":"W", "name":"W", "root":root,
+                        "fileId": crate::file_id(Path::new(&root)).unwrap(),
+                        "approval":{"journalSeq":null,"state":"unapproved"},
+                    }])
                 );
             }
         }
@@ -767,7 +767,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(f.store.resolve(&member).unwrap().workspace_root, None);
-        assert_eq!(f.store.enumerate(None).unwrap().workspaces[0].root, None);
+        assert_eq!(
+            serde_json::to_value(f.store.enumerate(None).unwrap().workspaces).unwrap(),
+            json!([{"workspaceId":"W","name":"W","root":null}])
+        );
     }
 
     #[test]

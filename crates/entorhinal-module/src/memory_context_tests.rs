@@ -122,6 +122,24 @@ impl Fixture {
         store.bind_root(&root, "fixture").unwrap();
         root
     }
+
+    fn workspace_folder(&self, name: &str) -> String {
+        let path = self.dir.join(name);
+        std::fs::create_dir(&path).unwrap();
+        crate::tests::canonical_test_path(path)
+            .to_str()
+            .unwrap()
+            .into()
+    }
+
+    fn workspace_approval_rows(&self) -> i64 {
+        rusqlite::Connection::open(self.dir.join("store.db"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM workspace_root_approval", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -142,6 +160,235 @@ fn approval(store: &entorhinal_core::RegistryStore, root: &str) -> &'static str 
         .unwrap()
         .approval
         .state
+}
+
+#[tokio::test]
+async fn workspace_approval_set_refuses_without_presence_and_writes_nothing() {
+    let f = Fixture::with_prompt(Prompt {
+        unavailable: true,
+        ..Default::default()
+    });
+    let root = f.workspace_folder("workspace-root");
+    let store = f.store();
+    let before = store.generation().unwrap();
+    let params = json!({"workspaceId":"W","root":root});
+    assert_eq!(
+        f.call(DIRECT, "set_workspace_root", params)
+            .await
+            .unwrap_err(),
+        "operator_presence_unavailable"
+    );
+    assert_eq!(f.count(), 1);
+    assert_eq!(store.generation().unwrap(), before);
+    let after = f
+        .call(CORE, "enumerate", json!({"workspaceId":"W"}))
+        .await
+        .unwrap();
+    assert!(after["workspaces"][0]["root"].is_null());
+    assert!(after["workspaces"][0].get("approval").is_none());
+    assert_eq!(f.workspace_approval_rows(), 0);
+}
+
+#[tokio::test]
+async fn workspace_approval_set_and_approve_commit_together_and_retries_do_not_prompt() {
+    let f = Fixture::new(false);
+    let root = f.workspace_folder("workspace-root");
+    let before = f.store().generation().unwrap();
+    let request = json!({"workspaceId":"W","root":root,"requestKey":"set-1"});
+    let set = f
+        .call(DIRECT, "set_workspace_root", request.clone())
+        .await
+        .unwrap();
+    assert_eq!(set["root"], root);
+    assert_eq!(
+        set["approval"],
+        json!({"journalSeq":before+2,"state":"approved"})
+    );
+    assert_eq!(set["generation"], before + 2);
+    assert_eq!(set["noop"], false);
+    assert_eq!(f.workspace_approval_rows(), 1);
+    assert_eq!(f.count(), 1);
+    let summaries = f.prompt.summaries.lock().unwrap().clone();
+    assert!(
+        summaries[0].contains("W") && summaries[0].contains(&root),
+        "{summaries:?}"
+    );
+    assert_eq!(
+        f.call(DIRECT, "set_workspace_root", request).await.unwrap(),
+        set
+    );
+    assert_eq!(f.count(), 1);
+    let noop = f
+        .call(
+            DIRECT,
+            "set_workspace_root",
+            json!({"workspaceId":"W","root":root}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(noop["noop"], true);
+    assert_eq!(noop["approval"], set["approval"]);
+    assert_eq!(f.store().generation().unwrap(), before + 2);
+}
+
+#[tokio::test]
+async fn workspace_approval_set_rejects_file_id_changed_during_prompt() {
+    let f = Fixture::new(false);
+    let root = f.workspace_folder("workspace-root");
+    let moved = f.dir.join("moved-folder");
+    let store = f.store();
+    let before = store.generation().unwrap();
+    let original = entorhinal_core::file_id(std::path::Path::new(&root)).unwrap();
+    let target = root.clone();
+    *f.prompt.on_prompt.lock().unwrap() = Some(Box::new(move || {
+        std::fs::rename(&target, moved).unwrap();
+        std::fs::create_dir(&target).unwrap();
+    }));
+    let request = json!({"workspaceId":"W","root":root});
+    assert_eq!(
+        f.call(DIRECT, "set_workspace_root", request)
+            .await
+            .unwrap_err(),
+        "operator_approval_stale"
+    );
+    assert_eq!(f.count(), 1);
+    assert_ne!(
+        entorhinal_core::file_id(std::path::Path::new(&root)).as_deref(),
+        Some(original.as_str())
+    );
+    assert_eq!(store.generation().unwrap(), before);
+    assert!(store.enumerate(Some("W")).unwrap().workspaces[0]
+        .root
+        .is_none());
+    assert_eq!(f.workspace_approval_rows(), 0);
+}
+
+#[tokio::test]
+async fn workspace_approval_approve_rejects_a_changed_workspace_root_during_prompt() {
+    let f = Fixture::new(false);
+    let first = f.workspace_folder("first");
+    let second = f.workspace_folder("second");
+    let store = f.store();
+    let set = |root| entorhinal_core::SetWorkspaceRootRequest {
+        workspace_id: "W".into(),
+        root: Some(root),
+        ..Default::default()
+    };
+    store.set_workspace_root(set(first)).unwrap();
+    let before = store.generation().unwrap();
+    let during_prompt = store.clone();
+    let changed = second.clone();
+    *f.prompt.on_prompt.lock().unwrap() = Some(Box::new(move || {
+        during_prompt.set_workspace_root(set(changed)).unwrap();
+    }));
+    assert_eq!(
+        f.call(DIRECT, "approve_workspace_root", json!({"workspaceId":"W"}))
+            .await
+            .unwrap_err(),
+        "operator_approval_stale"
+    );
+    assert_eq!(
+        store.generation().unwrap(),
+        before + 1,
+        "only the concurrent root change was written"
+    );
+    assert_eq!(
+        store.enumerate(Some("W")).unwrap().workspaces[0].root,
+        Some(second)
+    );
+    assert_eq!(f.workspace_approval_rows(), 0);
+}
+
+#[tokio::test]
+async fn workspace_approval_clear_and_unapprove_do_not_prompt_or_leave_approval() {
+    let f = Fixture::new(false);
+    let root = f.workspace_folder("workspace-root");
+    let set = json!({"workspaceId":"W","root":root});
+    f.call(DIRECT, "set_workspace_root", set.clone())
+        .await
+        .unwrap();
+    let revoked = f
+        .call(
+            DIRECT,
+            "unapprove_workspace_root",
+            json!({"workspaceId":"W"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked["root"], root);
+    assert_eq!(
+        revoked["approval"],
+        json!({"state":"unapproved","journalSeq":null})
+    );
+    assert_eq!(f.count(), 1);
+    assert_eq!(f.workspace_approval_rows(), 0);
+
+    let approved = f
+        .call(DIRECT, "approve_workspace_root", json!({"workspaceId":"W"}))
+        .await
+        .unwrap();
+    assert_eq!(approved["approval"]["state"], "approved");
+    assert_eq!(f.workspace_approval_rows(), 1);
+    let cleared = f
+        .call(
+            DIRECT,
+            "set_workspace_root",
+            json!({"workspaceId":"W","root":null}),
+        )
+        .await
+        .unwrap();
+    assert!(cleared["root"].is_null());
+    assert!(cleared.get("approval").is_none());
+    assert!(cleared.get("unapprovedReason").is_none());
+    assert_eq!(f.count(), 2);
+    assert_eq!(f.workspace_approval_rows(), 0);
+    assert!(f.store().verify().unwrap().ok);
+}
+
+#[tokio::test]
+async fn workspace_approval_reserved_prefrontal_refuses_every_write_without_side_effects() {
+    let f = Fixture::new(false);
+    let old = f.workspace_folder("old");
+    let new = f.workspace_folder("new");
+    let store = f.store();
+    store
+        .set_workspace_root(entorhinal_core::SetWorkspaceRootRequest {
+            workspace_id: "W".into(),
+            root: Some(old.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    let before = store.generation().unwrap();
+    for (op, req) in [
+        ("set_workspace_root", json!({"workspaceId":"W","root":new})),
+        ("set_workspace_root", json!({"workspaceId":"W","root":null})),
+        ("approve_workspace_root", json!({"workspaceId":"W"})),
+    ] {
+        assert_eq!(
+            f.call(CORE, op, req).await.unwrap_err(),
+            "write_not_permitted",
+            "{op}"
+        );
+    }
+    assert_eq!(store.generation().unwrap(), before);
+    assert_eq!(f.workspace_approval_rows(), 0);
+    assert_eq!(
+        store.enumerate(Some("W")).unwrap().workspaces[0].root,
+        Some(old)
+    );
+    f.call(DIRECT, "approve_workspace_root", json!({"workspaceId":"W"}))
+        .await
+        .unwrap();
+    let before = store.generation().unwrap();
+    assert_eq!(
+        f.call(CORE, "unapprove_workspace_root", json!({"workspaceId":"W"}))
+            .await
+            .unwrap_err(),
+        "write_not_permitted"
+    );
+    assert_eq!(store.generation().unwrap(), before);
+    assert_eq!(f.workspace_approval_rows(), 1);
+    assert_eq!(f.count(), 1);
 }
 
 #[tokio::test]

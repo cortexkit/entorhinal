@@ -135,7 +135,7 @@ pub struct Incarnation {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Approval {
-    /// `approved` only for a `bound` root whose current epoch is approved.
+    /// `approved` only when the folder still matches the identity approved.
     pub state: &'static str,
     /// The journal entry that approved it; null when unapproved.
     pub journal_seq: Option<i64>,

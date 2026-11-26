@@ -191,7 +191,9 @@ or another project already holds the key.
 ```sh
 ck workspaces list
 ck workspaces assign <project-id> <workspace-id>
-ck workspaces set-root <workspace-id> ~/src
+ck workspaces root <workspace-id> ~/src  # set-root is also accepted
+ck workspaces approve <workspace-id>
+ck workspaces unapprove <workspace-id>
 ck workspaces clear-root <workspace-id>
 ```
 
@@ -200,6 +202,14 @@ project has a live head or hirees, their name claims move with it; from `ck`
 that change needs operator confirmation, and it is refused if a moving name is taken in the
 target workspace. A workspace root is only what the operator sets; when none is
 set, none is reported.
+
+Setting a root shows a presence prompt and approves the folder if its filesystem
+identity can be read. `approve` prompts for an existing root; roots recorded
+before workspace approval was introduced start unapproved. A replacement folder
+at the same path must be approved again. Approval stays on this machine.
+`unapprove` revokes it without removing the path; `clear-root` removes both.
+Neither prompts. On a machine without operator presence support, setting or
+approving a workspace root is refused.
 
 Reverse: assign the project back, or run
 `ck workspaces clear-root <workspace-id>`.

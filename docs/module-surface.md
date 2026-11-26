@@ -155,8 +155,9 @@ Tests: `writes_are_refused_unless_the_operator_or_the_executive_opened_the_route
 
 Most project mutations are admitted from Direct or the executive; anyone else
 gets `write_not_permitted`. `register`, `attach_root`, `add_root`, `approve_root`,
-`approve_project`, `unapprove_root`, `unapprove_project`, and `set_workspace_root`
-are Direct-only, and refuse the executive with `write_not_permitted`.
+`approve_project`, `unapprove_root`, `unapprove_project`, `set_workspace_root`,
+`approve_workspace_root`, and `unapprove_workspace_root` are Direct-only, and
+refuse the executive with `write_not_permitted`.
 `attach_derived_parent` remains admitted from the executive without a prompt.
 A Direct `assign_workspace`, `upgrade_implicit` or `seed_import` that would
 move active agents' name claims into another workspace first asks for operator
@@ -173,7 +174,15 @@ transaction. Neither folder approval nor checkout identity is sent to other
 machines. The replies
 include `folderApprovals` with `{root, state}` for each root and a `reason` for
 each folder left unapproved because it could not be bound. Unapproving and
-setting a workspace root do not prompt.
+clearing a workspace root do not prompt.
+
+Setting or approving a workspace root prompts once, naming the workspace and
+folder. Unlike a project checkout, a workspace root is approved for its current
+`fileId`; a replacement at the same path reads as unapproved. A change during
+the prompt refuses `operator_approval_stale`. When setting a root whose file
+identity cannot be read, the write records the path without approving it, and
+the reply includes `unapprovedReason: "file_id_unavailable"`. The three workspace
+root mutations return the resulting `approval` when a root remains set.
 
 | Operation | Kind | What it does |
 |---|---|---|
@@ -182,13 +191,15 @@ setting a workspace root do not prompt.
 | `resolve_remote` | query | Find the project owning a GitHub repository through its live owned remotes. |
 | `resolve_root_key` | query | List local roots mapped to a project's machine-neutral root key. |
 | `preview_attach_root` | query | Match a checkout to an existing project and root key without attaching it. |
-| `enumerate` | query | List registered projects with workspace assignments, tags and liveness activity. Workspace roots and root records carry an opaque `fileId` (the folder's file-system identity, compared only for equality) when the folder can be read. |
+| `enumerate` | query | List registered projects with workspace assignments, tags and liveness activity. Workspace roots and root records carry an opaque `fileId` when the folder can be read. Workspaces with a root also include `approval: {journalSeq, state}`. |
 | `journal_tail` | query | Read the newest registry journal entries. |
 | `trust` | query | Show the project a path belongs to and each root's identity and approval. |
 | `verify` | query | Check registry invariants and replay the journal on a copy, reporting drift without writing. |
 | `register` | mutate | Register project roots under a workspace and approve those that can be bound. |
 | `assign_workspace` | mutate | Move a registered project to a different workspace. |
-| `set_workspace_root` | mutate | Set or clear a workspace's root directory. |
+| `set_workspace_root` | mutate | Set and approve a workspace's root directory in one write after confirmation, or clear it with `root: null` without a prompt. |
+| `approve_workspace_root` | mutate | Approve the current root of `{workspaceId}` after confirmation. |
+| `unapprove_workspace_root` | mutate | Revoke approval for `{workspaceId}` without changing its root. |
 | `set_owned_remotes` | mutate | Replace a root's owned remote names, or reset to `origin` with null. |
 | `upgrade_implicit` | mutate | Promote an implicit project to a registered one, keeping its id. |
 | `remove` | mutate | Remove a project registration; its id stops resolving. |

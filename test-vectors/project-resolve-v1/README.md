@@ -18,6 +18,8 @@ These reads are open to every principal, including flow-scoped routes. `Projects
 
 The original `resolve.json`, `resolve-project-id.json`, and `enumerate.json` capture replies from entorhinal module version **0.1.28**. The additional `resolve-root-records.json` and `resolve-remote.json` replies were captured from **0.1.46**; regenerating with that version also preserves the original files byte for byte. `enumerate-file-ids.json` was captured from **0.1.61**, which adds `fileId`; every other file is unchanged by it. `resolve-root-keys.json` and `enumerate-root-keys.json` were captured from **0.1.73** with a separate fixture; all six earlier files remain unchanged.
 
+Workspace approval adds `enumerate-workspace-approval.json` and adds only the workspace's `approval` member to `enumerate-file-ids.json`. The other JSON samples are byte-identical.
+
 ## Files and fields
 
 Each JSON file is an array of records with these fields:
@@ -46,6 +48,8 @@ A successful `enumerate` result includes `workspaces`, `projects`, `generation`,
 
 `enumerate` also gives each workspace with a `root`, and each of its root records, a `fileId`: the folder's file-system identity, read from disk when the request is served. It is an opaque string compared only for equality, built as `cortexkit-project-identity`'s `file_id_unix` (`unix:<dev>:<ino>`) or `file_id_windows` (`windows:<volumeSerial>:<fileIndex>`) build it, in decimal. It is omitted when the folder cannot be read, and it never appears in `resolve` replies. It lets a caller notice that a path now names a different folder, including workspace roots and plain folders, which have no checkout token. The real values differ per machine and per run, so `enumerate-file-ids.json` replaces each with a fixed value of the Unix form (`unix:1:100`, `unix:1:101`, `unix:1:102`), and the generating test checks the served values against the shared crate's format. `enumerate-root-keys.json` applies the same check and normalization, using `unix:1:100` and `unix:1:101` for its two roots.
 
+A workspace entry with a `root` has `approval: {journalSeq, state}` even if its `fileId` is unreadable. It is `approved` only while the folder's current `fileId` matches the id recorded at `journalSeq`; otherwise it is `unapproved` with a null `journalSeq`. Entries without a root omit `approval`.
+
 The implicit path id `pj-implicit1-30f9d5fcd6aa4ef2` demonstrates the derivation: BLAKE3 of the canonical path's UTF-8 bytes, taking the first 8 digest bytes as 16 lowercase hexadecimal characters and prefixing `pj-implicit1-`. The alias input is the corresponding id for `/fixture/alias-source`.
 
 - **`resolve.json`**: exact registered root (`via: root`), its subfolder (`via: walk`), an external linked worktree (`via: worktree`, with `worktreeOf`), an unregistered implicit directory, a removed registered root (`gone: true`), and the missing-`canonicalRoot` refusal.
@@ -56,14 +60,16 @@ The implicit path id `pj-implicit1-30f9d5fcd6aa4ef2` demonstrates the derivation
 - **`enumerate.json`**: an unfiltered `{}` request returning two projects in one workspace, with names for mapping project ids to dashboard labels.
 - **`enumerate-file-ids.json`**: an unfiltered `{}` request with a workspace root at `/fixture/workspace` and one project whose two roots are a bound, approved git checkout and a plain folder (`unverifiable`). The workspace and both root records carry `fileId`.
 - **`enumerate-root-keys.json`**: an unfiltered `{}` request with one project, `pj-root-keys`, containing the remote-keyed and label-keyed roots before the ownership change. Both root records carry `rootKey`, `rootKeyMismatch: false`, and normalized `fileId` values.
-- **`SHA256SUMS`**: SHA-256 hashes of the eight JSON files, with names relative to this directory.
+- **`enumerate-workspace-approval.json`**: an unfiltered `{}` request with three plain workspace folders: one approved after a prompt; one approved, then replaced at the same path, now unapproved; and one never approved. The fixture checks the replacement really has a different `fileId` and normalizes all three served ids.
+- **`SHA256SUMS`**: SHA-256 hashes of the nine JSON files, with names relative to this directory.
 
 ## SHA-256 hashes
 
 | File | SHA-256 |
 | --- | --- |
-| `enumerate-file-ids.json` | `d61153f6de4935012cfbcd7e3902d5145c0e96a2801a640f569d49bead57d07b` |
+| `enumerate-file-ids.json` | `663ea65d888ca26921449ff5bdd09a8f263ab30c3fd23e7c52517f2fde83e84b` |
 | `enumerate-root-keys.json` | `6e294e5f434cd8a4710ed7c1a5568c512ae072c3ff4e121aa12532f0ec2362fa` |
+| `enumerate-workspace-approval.json` | `fc190ee10b5fe9cc63105c7e5e83598c93393a4e987ae94228b614a1f0f4071a` |
 | `enumerate.json` | `89afedb88fa4ddec219f4932df22f26ca8395022c5c1dd399e3e50c9d50b94dd` |
 | `resolve-project-id.json` | `4af3d3d6dd6b279146da2e50dd48dd507674f2806f6ac35e8f04b380bc5e901e` |
 | `resolve-remote.json` | `e0504720dc0f4a81b532fbe4e0cfa4a43d0fa1b218f703cbc3efca5387e17cba` |
@@ -86,15 +92,15 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/project-resolve-v1')
-names = ['enumerate-file-ids.json', 'enumerate-root-keys.json', 'enumerate.json', 'resolve-project-id.json', 'resolve-remote.json', 'resolve-root-keys.json', 'resolve-root-records.json', 'resolve.json']
+names = ['enumerate-file-ids.json', 'enumerate-root-keys.json', 'enumerate-workspace-approval.json', 'enumerate.json', 'resolve-project-id.json', 'resolve-remote.json', 'resolve-root-keys.json', 'resolve-root-records.json', 'resolve.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')
 PY
 ```
 
-Without `ENTO_WRITE_SERVED_VECTORS=1`, the non-ignored `served_vectors::project_resolve_v1_records_match_published_files`, `served_vectors::project_resolve_remote_v1_records_match_published_file`, and `served_vectors::project_enumerate_file_ids_records_match_published_file` tests regenerate all eight files from entorhinal's real request handling and compare each file byte for byte. The first test includes both root-key files. `served_vectors::project_resolve_v1_records_roundtrip_through_project_identity` also checks every published record and freshly served reply through the published `cortexkit-project-identity` crate without losing or adding fields. These tests also run under nextest:
+Without `ENTO_WRITE_SERVED_VECTORS=1`, the `served_vectors::project_` tests regenerate all nine files from entorhinal's real request handling and compare each file byte for byte. The typed round-trip checks the fields known to the published `cortexkit-project-identity` crate. Its reader accepts the workspace approval fixture but does not retain the new field yet. These tests also run under nextest:
 
 ```sh
-cargo nextest run --workspace --all-targets --locked -E 'test(served_vectors::project_resolve_)'
+cargo nextest run --workspace --all-targets --locked -E 'test(served_vectors::project_)'
 ```

@@ -593,11 +593,11 @@ impl super::JournalWriter<'_> {
                     )?;
                 }
             }
-            // An enabled root insertion also appends its local assignment row.
-            // Reply generations are always the committed journal head, not the
-            // earlier operation row whose response is cached.
+            // Root assignment and folder approval can append rows after the
+            // operation row whose response is cached. Return the latest journal sequence.
             let generation = if super::log_schema::log_enabled(tx)?
                 || action.value.get("folderApprovals").is_some()
+                || (op == "set_workspace_root" && action.value.get("approval").is_some())
             {
                 tx.query_row(
                     "SELECT COALESCE(MAX(seq),0) FROM registry_journal",
@@ -1141,25 +1141,9 @@ impl super::JournalWriter<'_> {
         // filesystem, and the journal must record exactly the value the
         // projection holds so `rebuild` reproduces it without re-reading disk.
         if let Some(root) = req.root.as_deref() {
-            if !Path::new(root).is_absolute() {
-                return Err(domain(
-                    "not_absolute",
-                    format!("workspace root must be an absolute path: {root}"),
-                ));
-            }
-            canonical(root)?;
-            if !Path::new(root).is_dir() {
-                return Err(domain(
-                    "not_a_directory",
-                    format!("workspace root is not a directory: {root}"),
-                ));
-            }
+            crate::workspace_approval::validate_root(root)?;
         }
-        let key = req.request_key.clone();
-        let actor = req.actor.clone().unwrap_or_else(|| "module".into());
-        let payload =
-            serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
-        self.mutation("set_workspace_root", key.clone().as_deref(), move |tx| {
+        self.mutation("set_workspace_root", req.request_key.as_deref(), |tx| {
             let current = tx
                 .query_row(
                     "SELECT r.root FROM workspace w
@@ -1172,41 +1156,52 @@ impl super::JournalWriter<'_> {
             let Some(current) = current else {
                 return Err(domain("not_found", &req.workspace_id));
             };
-            let value = json!({"workspaceId": req.workspace_id, "root": req.root});
-            // Setting the value it already holds appends nothing, the same rule
-            // `assign_workspace` follows, so repeated calls don't grow the journal.
+            // A root change with no approval work appends only if the path changes.
             if current == req.root {
                 return Ok(Action {
                     changed: false,
                     seq: None,
-                    value,
-                    payload,
+                    value: json!({"workspaceId": req.workspace_id, "root": req.root}),
+                    payload: serde_json::to_value(&req)
+                        .map_err(|e| domain("encode_failed", e.to_string()))?,
                 });
             }
-            let seq = append(
-                tx,
-                "set_workspace_root",
-                &payload,
-                &actor,
-                key.as_deref(),
-                now,
-                self.principal,
-            )?;
-            let enabled = super::log_schema::log_enabled(tx)?;
-            set_workspace_root_projection(
-                tx,
-                &req.workspace_id,
-                req.root.as_deref(),
-                now,
-                enabled,
-            )?;
+            let (seq, payload) = self.write_workspace_root(tx, &req, now)?;
             Ok(Action {
                 changed: true,
                 seq: Some(seq),
-                value,
+                value: json!({"workspaceId": req.workspace_id, "root": req.root}),
                 payload,
             })
         })
+    }
+
+    /// Journal only the root change, using the same payload with or without approval.
+    pub(crate) fn write_workspace_root(
+        &self,
+        tx: &Transaction<'_>,
+        req: &SetWorkspaceRootRequest,
+        now: i64,
+    ) -> Result<(i64, Value), RegistryError> {
+        let payload =
+            serde_json::to_value(req).map_err(|e| domain("encode_failed", e.to_string()))?;
+        let seq = append(
+            tx,
+            "set_workspace_root",
+            &payload,
+            req.actor.as_deref().unwrap_or("module"),
+            req.request_key.as_deref(),
+            now,
+            self.principal,
+        )?;
+        set_workspace_root_projection(
+            tx,
+            &req.workspace_id,
+            req.root.as_deref(),
+            now,
+            super::log_schema::log_enabled(tx)?,
+        )?;
+        Ok((seq, payload))
     }
 
     pub fn upgrade_implicit(&self, req: UpgradeImplicitRequest) -> Result<Vec<u8>, RegistryError> {
@@ -1708,6 +1703,7 @@ pub(crate) const DERIVED_TABLES: &[&str] = &[
     "project_root_key",
     "project_root",
     "project",
+    "workspace_root_approval",
     "workspace_root",
     "workspace",
     "root_binding",
@@ -2135,6 +2131,9 @@ fn replay(
             for p in r.derived_root_parents {
                 tx.execute("INSERT OR IGNORE INTO derived_root_parent(canonical_parent,project_id) VALUES(?1,?2)",params![p,id])?;
             }
+        }
+        crate::workspace_approval::APPROVE | crate::workspace_approval::UNAPPROVE => {
+            crate::workspace_approval::replay(tx, seq, v, now)?;
         }
         // Mirrors the live `set_workspace_root`. The journal holds the value
         // that was validated when it was set, so replay never re-reads disk: a

@@ -1940,6 +1940,8 @@ mod tests {
             "register",
             "assign_workspace",
             "set_workspace_root",
+            "approve_workspace_root",
+            "unapprove_workspace_root",
             "set_owned_remotes",
             "upgrade_implicit",
             "remove",

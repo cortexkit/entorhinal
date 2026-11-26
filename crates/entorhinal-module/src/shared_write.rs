@@ -4,6 +4,9 @@
 use super::*;
 use entorhinal_core::agent::{AgentPrecheck, OperatorApproval};
 use entorhinal_core::folder_approval::{FolderPlan, FolderPrecheck, FolderWrite};
+use entorhinal_core::workspace_approval::{
+    self, WorkspaceRootPlan, WorkspaceRootPrecheck, WorkspaceRootWrite,
+};
 use entorhinal_core::RegistryStore;
 use serde_json::Value;
 use std::time::Duration;
@@ -1449,6 +1452,7 @@ enum Write {
         Box<entorhinal_core::agent::consent::ConsentCommit>,
     ),
     Folder(FolderWrite, Option<Box<FolderPlan>>),
+    WorkspaceRoot(WorkspaceRootWrite, Option<Box<WorkspaceRootPlan>>),
     Domain(entorhinal_core::SetProjectDomainRequest),
     Document(entorhinal_core::SetWorkspaceDocumentRequest),
     Assign(AssignWorkspaceRequest),
@@ -1476,6 +1480,16 @@ impl Write {
             "workspace.set_document" => {
                 Self::Document(serde_json::from_value(params).map_err(invalid_params)?)
             }
+            "set_workspace_root" => Self::WorkspaceRoot(
+                WorkspaceRootWrite::Set(serde_json::from_value(params).map_err(invalid_params)?),
+                None,
+            ),
+            workspace_approval::APPROVE => Self::WorkspaceRoot(
+                WorkspaceRootWrite::Approve(
+                    serde_json::from_value(params).map_err(invalid_params)?,
+                ),
+                None,
+            ),
             "register" => Self::Folder(
                 FolderWrite::Register(serde_json::from_value(params).map_err(invalid_params)?),
                 None,
@@ -1558,6 +1572,7 @@ impl Write {
             Self::Domain(r) => Some(r.request_key.as_str()),
             Self::Document(r) => Some(r.request_key.as_str()),
             Self::Folder(r, _) => r.request_key(),
+            Self::WorkspaceRoot(r, _) => r.request_key(),
             Self::Assign(r) => r.request_key.as_deref(),
             Self::Upgrade(r) => r.request_key.as_deref(),
             Self::Remove(r) => r.request_key.as_deref(),
@@ -1611,6 +1626,15 @@ impl Write {
                     HandlerError::new(
                         "operator_presence_unavailable",
                         "folder write requires the served operator confirmation path",
+                    )
+                })?;
+                r.commit(&writer, &plan, now)
+            }
+            Self::WorkspaceRoot(r, plan) => {
+                let plan = plan.ok_or_else(|| {
+                    HandlerError::new(
+                        "operator_presence_unavailable",
+                        "workspace root approval requires the served operator confirmation path",
                     )
                 })?;
                 r.commit(&writer, &plan, now)
@@ -1881,7 +1905,7 @@ impl ProjectsHandler {
             && (agent_ops::CONFIRMABLE_METHODS.contains(&request.method.as_str())
                 || request.method == super::user_profile::SET
                 || request.method == "placement.backfill"
-                || super::CONFIRMED_FOLDER_WRITES.contains(&request.method.as_str()));
+                || super::requires_folder_confirmation(&request.method, &request.params));
         if request.method == "placement.backfill" {
             authorize_write(&request.method, admission.principal.as_ref())?;
         }
@@ -2123,7 +2147,7 @@ impl ProjectsHandler {
             let method = request.method.clone();
             let params = request.params.clone();
             let clock = self.clock;
-            let (precheck, folder_plan) = hub_or_local_sql(
+            let (precheck, confirmed_write) = hub_or_local_sql(
                 store.as_ref(),
                 &hub_sql,
                 early_deadline,
@@ -2132,9 +2156,21 @@ impl ProjectsHandler {
                     if let Some(Write::Folder(write, _)) = &check {
                         return Ok(match write.precheck(store, clock())? {
                             FolderPrecheck::Cached(body) => (AgentPrecheck::Cached(body), None),
-                            FolderPrecheck::Ready(plan) => {
-                                (AgentPrecheck::Ready(plan.summary().to_owned()), Some(plan))
+                            FolderPrecheck::Ready(plan) => (
+                                AgentPrecheck::Ready(plan.summary().to_owned()),
+                                Some(Write::Folder(write.clone(), Some(plan))),
+                            ),
+                        });
+                    }
+                    if let Some(Write::WorkspaceRoot(write, _)) = &check {
+                        return Ok(match write.precheck(store)? {
+                            WorkspaceRootPrecheck::Cached(body) => {
+                                (AgentPrecheck::Cached(body), None)
                             }
+                            WorkspaceRootPrecheck::Ready(plan) => (
+                                AgentPrecheck::Ready(plan.summary().to_owned()),
+                                Some(Write::WorkspaceRoot(write.clone(), Some(plan))),
+                            ),
                         });
                     }
                     let precheck = if let Some(Write::PlacementBackfill(req)) = &check {
@@ -2192,9 +2228,7 @@ impl ProjectsHandler {
                 }
                 budget_start = Instant::now();
                 approval = Some(OperatorApproval::new(summary));
-                if let Some(Write::Folder(_, plan)) = &mut prepared {
-                    *plan = folder_plan;
-                }
+                prepared = confirmed_write.or(prepared);
                 confirmation = Some(guard);
             }
         } else if state == "enabled" {
