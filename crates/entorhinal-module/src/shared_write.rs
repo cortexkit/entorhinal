@@ -2561,6 +2561,12 @@ fn hub_request(
     request: &WireRequest,
     write: &Write,
 ) -> Result<(Option<String>, String), HandlerError> {
+    if let Write::ManifestAvatar(approval, index) = write {
+        let (key, digest) = approval.entry_hub_request(*index).ok_or_else(|| {
+            HandlerError::new("invalid_request", "manifest entry has no request key")
+        })?;
+        return Ok((Some(key.to_owned()), digest.to_owned()));
+    }
     let consent = match write {
         Write::Consent(_, commit) | Write::CatalogInstall(_, commit) => Some(commit.as_ref()),
         _ => None,

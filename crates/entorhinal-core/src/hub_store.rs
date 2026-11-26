@@ -374,6 +374,28 @@ fn save_attempt(
 const OPEN_HUB_ATTEMPTS: &str = "SELECT request_key FROM hub_attempt WHERE outcome IS NULL
     AND substr(step,1,length(?1))=?1 ORDER BY request_key";
 
+pub(crate) fn hub_local_reply(
+    conn: &Connection,
+    key: &str,
+    digest: &str,
+) -> Result<Option<Vec<u8>>, RegistryError> {
+    let row = conn
+        .query_row(
+            "SELECT params_digest,reply FROM hub_local_reply WHERE request_key=?1",
+            [key],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    match row {
+        Some((saved, _)) if saved != digest => Err(crate::mutations::domain(
+            "request_key_conflict",
+            "request key has different arguments",
+        )),
+        Some((_, reply)) => Ok(Some(reply.into_bytes())),
+        None => Ok(None),
+    }
+}
+
 impl RegistryStore {
     pub fn hub_created_agent(
         &self,
@@ -745,22 +767,7 @@ impl RegistryStore {
         key: &str,
         digest: &str,
     ) -> Result<Option<Vec<u8>>, RegistryError> {
-        let row = self.read(|conn| {
-            conn.query_row(
-                "SELECT params_digest,reply FROM hub_local_reply WHERE request_key=?1",
-                [key],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
-            .optional()
-        })?;
-        match row {
-            Some((saved, _)) if saved != digest => Err(crate::mutations::domain(
-                "request_key_conflict",
-                "request key has different arguments",
-            )),
-            Some((_, reply)) => Ok(Some(reply.into_bytes())),
-            None => Ok(None),
-        }
+        self.read(|conn| Ok(hub_local_reply(conn, key, digest)))?
     }
 
     pub fn hub_local_time(&self, key: &str) -> Result<Option<i64>, RegistryError> {

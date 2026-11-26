@@ -672,6 +672,7 @@ impl IdentityRig {
     }
 }
 
+mod avatar_manifest;
 mod epochs;
 mod residence;
 

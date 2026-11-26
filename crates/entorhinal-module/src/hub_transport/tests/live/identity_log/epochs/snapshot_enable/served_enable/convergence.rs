@@ -229,6 +229,7 @@ async fn hub_avatar_manifest_resumes_after_second_write_refusal_without_duplicat
     else {
         panic!("expected second write to refuse: {outcome:?}")
     };
+    assert_eq!(code, "hub_write_refused");
     assert_eq!(
         detail["batch"]["written"].as_array().unwrap().len(),
         1,
@@ -242,11 +243,11 @@ async fn hub_avatar_manifest_resumes_after_second_write_refusal_without_duplicat
     );
     rig.a.leaf.refuse_log_kind_after.lock().unwrap().take();
     let resumed = result(a.handler.handle_served_request(&wire, ROUTE).await);
-    assert_eq!(resumed["written"].as_array().unwrap().len(), 1);
+    assert_eq!(resumed["written"].as_array().unwrap().len(), 2);
+    assert!(resumed["skipped"].as_array().unwrap().is_empty());
     assert!(resumed["remaining"].as_array().unwrap().is_empty());
     let repeated = result(a.handler.handle_served_request(&wire, ROUTE).await);
-    assert!(repeated["written"].as_array().unwrap().is_empty());
-    assert!(repeated["remaining"].as_array().unwrap().is_empty());
+    assert_eq!(repeated, resumed);
     assert_eq!(confirmer.summaries.lock().unwrap().len(), 2);
     apply_through(&a, &b).await;
     let changes = b.store().agent_changes(cursor, None).unwrap().entries;

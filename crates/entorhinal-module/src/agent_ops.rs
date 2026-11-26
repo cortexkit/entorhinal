@@ -306,6 +306,10 @@ pub(super) struct AvatarBatchApproval {
 }
 
 impl AvatarBatchApproval {
+    pub(super) fn entry_hub_request(&self, index: usize) -> Option<(&str, &str)> {
+        self.plan.entry_hub_request(index)
+    }
+
     pub(super) fn probe(
         &self,
         store: &entorhinal_core::RegistryStore,

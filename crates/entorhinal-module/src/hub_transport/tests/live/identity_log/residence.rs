@@ -16,7 +16,7 @@ const MIGRATED: &str = "agent_0000000000000040";
 const OTHER: &str = "agent_0000000000000041";
 
 #[derive(Default)]
-struct Image(HashMap<String, (Option<String>, i64)>);
+pub(super) struct Image(HashMap<String, (Option<String>, i64)>);
 impl SnapshotClaims for Image {
     fn claim(&self, agent: &str) -> Option<(Option<String>, i64)> {
         self.0.get(agent).cloned()
@@ -445,7 +445,7 @@ fn bind(handler: &ProjectsHandler, principal: subc_protocol::Principal) {
     );
 }
 
-fn residence(node: &Node, image: Arc<Image>) {
+pub(super) fn residence(node: &Node, image: Arc<Image>) {
     let leaf = node.leaf.clone();
     let feed = Feed::kv(node.handler.health.clone(), move |_| {
         Binding {

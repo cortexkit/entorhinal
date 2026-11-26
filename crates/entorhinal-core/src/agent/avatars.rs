@@ -16,7 +16,7 @@ use crate::{mutations::Action, JournalWriter, RegistryStore};
 pub(crate) const APPLY_METHOD: &str = "agent.apply_avatar_manifest";
 const SET_AVATAR: &str = "agent.set_avatar";
 
-fn cached(
+fn journal_reply(
     conn: &Connection,
     op: &str,
     key: Option<&str>,
@@ -48,6 +48,54 @@ struct ManifestEntry {
     avatar_genome: String,
     avatar_type: String,
     avatar_version: i64,
+}
+
+#[derive(Clone, Serialize)]
+struct EntryRequest {
+    key: String,
+    digest: String,
+}
+
+impl EntryRequest {
+    fn new(
+        batch_key: &str,
+        entry: &ManifestEntry,
+        replace: bool,
+        actor: &str,
+    ) -> Result<Self, AgentMutationError> {
+        // Bind the entry's arguments, not the plan's saved agent rows, which
+        // can change when an operator reapproves the remaining work on a retry.
+        let args = serde_json::to_vec(&(APPLY_METHOD, entry, replace, actor))
+            .map_err(|e| AgentMutationError::new("encode_failed", e.to_string()))?;
+        Ok(Self {
+            key: format!("{batch_key}:{}", entry.agent_id),
+            digest: blake3::hash(&args).to_hex().to_string(),
+        })
+    }
+}
+
+fn written_reply(
+    conn: &Connection,
+    request: Option<&EntryRequest>,
+) -> Result<Option<Value>, AgentMutationError> {
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    let decode_reply = |bytes: Vec<u8>| {
+        serde_json::from_slice::<Value>(&bytes)
+            .map_err(|e| AgentMutationError::new("decode_failed", e.to_string()))
+    };
+    // Applying a hub log entry journals the change without a request key.
+    // The writing machine saves the reply with the key and digest separately.
+    if let Some(bytes) = crate::hub_store::hub_local_reply(conn, &request.key, &request.digest)? {
+        let reply = decode_reply(bytes)?;
+        if reply["result"]["applied"] == true {
+            return Ok(Some(reply));
+        }
+    }
+    journal_reply(conn, SET_AVATAR, Some(&request.key))?
+        .map(decode_reply)
+        .transpose()
 }
 
 #[derive(Deserialize)]
@@ -92,7 +140,7 @@ enum State {
 struct Planned {
     row: Option<AgentRow>,
     entry: ManifestEntry,
-    key: Option<String>,
+    request: Option<EntryRequest>,
     state: State,
 }
 
@@ -169,7 +217,12 @@ impl AvatarManifestPlan {
     }
 
     pub fn entry_key(&self, index: usize) -> Option<&str> {
-        self.rows.get(index).and_then(|p| p.key.as_deref())
+        self.entry_hub_request(index).map(|(key, _)| key)
+    }
+
+    pub fn entry_hub_request(&self, index: usize) -> Option<(&str, &str)> {
+        let request = self.rows.get(index)?.request.as_ref()?;
+        Some((&request.key, &request.digest))
     }
 
     /// Replays are checked before live identity/identical-genome rules, because
@@ -209,16 +262,15 @@ fn plan(
         if let Err(error) = validate_agent_avatar(&entry.avatar_genome, Some(&entry.avatar_type)) {
             problems.push(format!("{id}: {error}"));
         }
-        let key = batch_key.map(|key| format!("{key}:{id}"));
-        let reply = cached(conn, SET_AVATAR, key.as_deref())?;
-        if let Some(reply) = reply {
-            let reply: Value = serde_json::from_slice(&reply)
-                .map_err(|e| AgentMutationError::new("decode_failed", e.to_string()))?;
+        let entry_request = batch_key
+            .map(|key| EntryRequest::new(key, &entry, request.replace, &actor))
+            .transpose()?;
+        if let Some(reply) = written_reply(conn, entry_request.as_ref())? {
             generation = generation.max(reply["result"]["generation"].as_i64().unwrap_or(0));
             rows.push(Planned {
                 row: None,
                 entry,
-                key,
+                request: entry_request,
                 state: State::Written(reply["result"]["agent"].clone()),
             });
             continue;
@@ -256,7 +308,7 @@ fn plan(
                 rows.push(Planned {
                     row: Some(row),
                     entry,
-                    key,
+                    request: entry_request,
                     state,
                 });
             }
@@ -353,8 +405,8 @@ impl JournalWriter<'_> {
     /// whole approved plan again: the operator approval must still match, and
     /// every entry must still find its agent unchanged and its genome valid.
     /// The only entries skipped in that check are ones already written, that
-    /// is, whose request key has a cached reply in the journal (found when the
-    /// plan was made, or since).
+    /// is, whose request key has a reply in the journal or a successful
+    /// hub-local reply (found when the plan was made, or since).
     pub fn apply_avatar_manifest_entry(
         &self,
         plan: &AvatarManifestPlan,
@@ -369,14 +421,15 @@ impl JournalWriter<'_> {
             .ok_or_else(|| {
                 AgentMutationError::new("invalid_request", "not a pending manifest entry")
             })?;
-        self.mutation_with_error(SET_AVATAR, planned.key.as_deref(), |tx| {
+        let key = plan.entry_key(index);
+        self.mutation_with_error(SET_AVATAR, key, |tx| {
             require_cutover(tx)?;
             if !approval.approves(&plan.summary()?) {
                 return Err(stale());
             }
             for expected in &plan.rows {
                 if matches!(expected.state, State::Written(_))
-                    || cached(tx, SET_AVATAR, expected.key.as_deref())?.is_some()
+                    || written_reply(tx, expected.request.as_ref())?.is_some()
                 {
                     continue;
                 }
@@ -404,7 +457,7 @@ impl JournalWriter<'_> {
                 AgentChangeEntry::new(SET_AVATAR, row, vec![]),
                 json!({"agent":planned.description(),"applied":true}),
                 &plan.actor,
-                planned.key.as_deref(),
+                key,
                 now,
                 "direct",
             )?;
