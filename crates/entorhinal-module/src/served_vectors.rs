@@ -85,7 +85,7 @@ impl Fixture {
         let fixture = Self::empty(label, confirmer);
         // A rootless project is valid. Its fleet placement has no canonicalRoot,
         // so scratch paths and Windows drive letters never enter the records.
-        fixture.success(DIRECT,"register",json!({"projectId":"served-project","name":"Served project","roots":[],"workspaceId":"served-workspace"})).await;
+        fixture.handler.seed_project(json!({"projectId":"served-project","name":"Served project","roots":[],"workspaceId":"served-workspace"}), "direct").unwrap();
         fixture
     }
 
@@ -1670,23 +1670,18 @@ async fn project_resolve_v1_records() -> [(&'static str, Vec<String>); 4] {
         ),
         ("pj-gone-root", "Gone Root", "ws-gone", gone_root.as_str()),
     ] {
-        let (_, reply) = fixture
-            .record(
-                SESSION_CORE,
-                WRITER_MODULE,
-                "register",
+        fixture
+            .handler
+            .seed_project(
                 json!({
                     "projectId":project_id,
                     "name":name,
                     "roots":[project_root],
                     "workspaceId":workspace_id
                 }),
+                "reserved:prefrontal",
             )
-            .await;
-        assert!(
-            reply.get("result").is_some(),
-            "fixture project registration failed: {reply}"
-        );
+            .unwrap();
     }
 
     let worktree = fixture.dir.join("external-worktree");
@@ -1827,23 +1822,18 @@ async fn project_resolve_v1_records() -> [(&'static str, Vec<String>); 4] {
         ("pj-dashboard-editor", "Editor"),
         ("pj-dashboard-terminal", "Terminal"),
     ] {
-        let (_, reply) = enumeration
-            .record(
-                SESSION_CORE,
-                WRITER_MODULE,
-                "register",
+        enumeration
+            .handler
+            .seed_project(
                 json!({
                     "projectId":project_id,
                     "name":name,
                     "roots":[],
                     "workspaceId":"ws-dashboard"
                 }),
+                "reserved:prefrontal",
             )
-            .await;
-        assert!(
-            reply.get("result").is_some(),
-            "fixture project registration failed: {reply}"
-        );
+            .unwrap();
     }
     enumeration
         .handler
@@ -1883,18 +1873,13 @@ async fn project_resolve_v1_records() -> [(&'static str, Vec<String>); 4] {
         // /var, a link to /private/var, and registration refuses a path that
         // isn't canonical.
         let canonical = crate::tests::canonical_test_path(path);
-        let (_, reply) = identities
-            .record(
-                SESSION_CORE,
-                WRITER_MODULE,
-                "register",
+        identities
+            .handler
+            .seed_project(
                 json!({"projectId":project_id,"name":name,"roots":[canonical]}),
+                "reserved:prefrontal",
             )
-            .await;
-        assert!(
-            reply.get("result").is_some(),
-            "fixture project registration failed: {reply}"
-        );
+            .unwrap();
     }
     let root = crate::tests::canonical_test_path(root)
         .to_string_lossy()
@@ -2264,28 +2249,27 @@ async fn project_enumerate_file_ids_records() -> Vec<String> {
         canonical(&git_root),
         canonical(&plain_root),
     );
-    for (method, params) in [
-        (
-            "register",
+    fixture
+        .handler
+        .seed_project(
             json!({"projectId":"pj-file-ids","name":"File Ids","roots":[git_root, plain_root]}),
-        ),
-        (
-            "assign_workspace",
-            json!({"projectId":"pj-file-ids","workspaceId":"ws-file-ids","workspaceName":"File Ids"}),
-        ),
-        (
-            "set_workspace_root",
+            "reserved:prefrontal",
+        )
+        .unwrap();
+    let (_, reply) = fixture.record(SESSION_CORE, WRITER_MODULE, "assign_workspace",
+        json!({"projectId":"pj-file-ids","workspaceId":"ws-file-ids","workspaceName":"File Ids"}),
+    ).await;
+    assert!(
+        reply.get("result").is_some(),
+        "fixture assignment failed: {reply}"
+    );
+    fixture
+        .handler
+        .set_workspace_root(
             json!({"workspaceId":"ws-file-ids","root":workspace}),
-        ),
-    ] {
-        let (_, reply) = fixture
-            .record(SESSION_CORE, WRITER_MODULE, method, params)
-            .await;
-        assert!(
-            reply.get("result").is_some(),
-            "fixture {method} failed: {reply}"
-        );
-    }
+            "direct",
+        )
+        .unwrap();
     std::fs::write(
         PathBuf::from(&git_root).join(".git/cortexkit-root-incarnation"),
         format!("{}\n", "0123456789abcdef".repeat(4)),
@@ -2363,15 +2347,13 @@ async fn projects_enumerate_control_op_matches_routed_enumerate() {
     let root = crate::tests::canonical_test_path(&root)
         .to_string_lossy()
         .into_owned();
-    let (_, reply) = fixture
-        .record(
-            SESSION_CORE,
-            WRITER_MODULE,
-            "register",
+    fixture
+        .handler
+        .seed_project(
             json!({"projectId":"pj-control","name":"Control","roots":[root]}),
+            "reserved:prefrontal",
         )
-        .await;
-    assert!(reply.get("result").is_some(), "register failed: {reply}");
+        .unwrap();
     let (_, routed) = fixture
         .record(SESSION_READER, READER_MODULE, "enumerate", json!({}))
         .await;
@@ -2484,18 +2466,13 @@ async fn project_resolve_remote_v1_records() -> Vec<String> {
         let root = crate::tests::canonical_test_path(root)
             .to_string_lossy()
             .into_owned();
-        let (_, reply) = fixture
-            .record(
-                SESSION_CORE,
-                WRITER_MODULE,
-                "register",
+        fixture
+            .handler
+            .seed_project(
                 json!({"projectId":project_id,"name":name,"roots":[root]}),
+                "reserved:prefrontal",
             )
-            .await;
-        assert!(
-            reply.get("result").is_some(),
-            "fixture project registration failed: {reply}"
-        );
+            .unwrap();
         // Map complete paths, not just the scratch prefix: Windows separators
         // inside a path must also become the fixed forward-slash spelling.
         paths.push((root, format!("/fixture/{folder}")));
@@ -3048,9 +3025,11 @@ async fn session_lookup_cases_match_published_file() {
     const SESSION_DIRECT: RouteKey = (908, 1);
     let fixture = SessionFixture::new("served-session-lookups").await;
     let mut receiver = SessionFixture::new("served-session-lookups-receiver").await;
-    receiver.handler.operator_confirmer = Arc::new(Approve {
-        summaries: std::sync::Mutex::new(vec![]),
-    });
+    receiver.handler.operator_confirmer = Arc::new(crate::agent_ops::tests::Yes);
+    receiver.handler.route_admissions().insert(
+        SESSION_DIRECT,
+        RouteAdmission::from_bind(Some(Principal::Direct), None),
+    );
     let root = fixture.dir.join("lookup-project");
     std::fs::create_dir_all(root.join(".git")).unwrap();
     // Canonicalize before registration so macOS's /var symlink cannot make
@@ -3066,25 +3045,16 @@ async fn session_lookup_cases_match_published_file() {
             .store()
             .check_store_origin(Some(machine_id), 700)
             .unwrap();
-        machine.handler.route_admissions().insert(
-            SESSION_DIRECT,
-            RouteAdmission::from_bind(Some(Principal::Direct), None),
-        );
-        let request = serde_json::to_vec(&json!({"method":"register","params":{
-            "projectId":"served-project","name":"Lookup project","roots":[root],
-            "workspaceId":"served-workspace"
-        }}))
-        .unwrap();
-        let registered = machine
+        machine
             .handler
-            .handle_served_request(&request, SESSION_DIRECT)
-            .await;
-        if !matches!(registered, HandlerOutcome::Response(_)) {
-            panic!(
-                "lookup project registration refused: {}",
-                refusal(registered)
-            );
-        }
+            .seed_project(
+                json!({
+                    "projectId":"served-project","name":"Lookup project","roots":[root],
+                    "workspaceId":"served-workspace"
+                }),
+                "direct",
+            )
+            .unwrap();
         let source = machine.snapshot();
         seed_agent(
             &source,
@@ -3435,18 +3405,16 @@ async fn sessions_head_runners_match_published_file() {
     let root = crate::tests::canonical_test_path(&root)
         .to_string_lossy()
         .into_owned();
-    let (_, project) = fixture
-        .record(
-            SESSION_CORE,
-            WRITER_MODULE,
-            "register",
+    fixture
+        .handler
+        .seed_project(
             json!({
                 "projectId":"served-project", "name":"Orchard", "roots":[root],
                 "workspaceId":"served-workspace"
             }),
+            "reserved:prefrontal",
         )
-        .await;
-    assert!(project.get("result").is_some(), "{project}");
+        .unwrap();
     let source = fixture.snapshot();
     seed_agent(&source, AGENT, "Orchard Head", None, false, true);
     drop(source);
@@ -4585,8 +4553,8 @@ async fn served_changes_match_published_file() {
         summaries: std::sync::Mutex::new(vec![]),
     });
     let fixture = Fixture::with_confirmer("served-changes", confirmer.clone()).await;
-    fixture.success(DIRECT, "register", json!({"projectId":"hiree-project","name":"Hiree project","roots":[],"workspaceId":"served-workspace"})).await;
-    fixture.success(DIRECT, "register", json!({"projectId":"clear-project","name":"Clear project","roots":[],"workspaceId":"served-workspace"})).await;
+    fixture.handler.seed_project(json!({"projectId":"hiree-project","name":"Hiree project","roots":[],"workspaceId":"served-workspace"}), "direct").unwrap();
+    fixture.handler.seed_project(json!({"projectId":"clear-project","name":"Clear project","roots":[],"workspaceId":"served-workspace"}), "direct").unwrap();
     let source = fixture.snapshot();
     seed_agent(&source, HEAD, "Off placement", None, false, true);
     seed_agent(&source, NO_AVATAR, "Stored workspace", None, false, false);
@@ -5204,16 +5172,16 @@ async fn memory_context_v1_records_match_published_files() {
         ),
     )
     .unwrap();
-    fixture.success(CORE,"register",json!({"projectId":"served-project","name":"Served project","roots":[root],"workspaceId":"served-workspace","domain":"@example/software"})).await;
+    fixture.handler.seed_project(json!({"projectId":"served-project","name":"Served project","roots":[root],"workspaceId":"served-workspace","domain":"@example/software"}), "reserved:prefrontal").unwrap();
     let bare = crate::tests::canonical_test_path(&fixture.dir).join("bare");
     std::fs::create_dir_all(&bare).unwrap();
     fixture
-        .success(
-            CORE,
-            "register",
+        .handler
+        .seed_project(
             json!({"projectId":"agentless","name":"Agentless","roots":[bare]}),
+            "reserved:prefrontal",
         )
-        .await;
+        .unwrap();
     let missing = crate::tests::canonical_test_path(&fixture.dir).join("unregistered");
     std::fs::create_dir_all(&missing).unwrap();
     let mut records = Vec::new();
@@ -5347,13 +5315,10 @@ async fn memory_context_v1_populated_records_match_published_file() {
     let fixture = Fixture::new("served-memory-context-populated").await;
     let root = crate::tests::canonical_test_path(&fixture.dir).join("project");
     std::fs::create_dir_all(&root).unwrap();
-    fixture
-        .success(
-            CORE,
-            "register",
+    fixture.handler.seed_project(
             json!({"projectId":"served-project","name":"Served project","roots":[root],"workspaceId":"served-workspace"}),
-        )
-        .await;
+            "reserved:prefrontal",
+        ).unwrap();
     let source = fixture.snapshot();
     seed_agent(&source, ASSISTANT, "Mira", None, false, false);
     seed_agent(&source, RETIRED, "Oren", None, true, false);

@@ -1592,6 +1592,10 @@ async fn memory_register_domain_is_visible_and_bound_to_tool_consent() {
         json!({"label":"Memory domain","value":"@example/software"})
     );
     assert_eq!(card["scope"]["target"]["domain"], "@example/software");
+    assert!(!card["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("approved for agents"));
     let context = store(&f)
         .context_project(f.root.join("domain-project").to_str().unwrap(), "fixed")
         .unwrap();
@@ -1607,4 +1611,61 @@ async fn memory_register_domain_is_visible_and_bound_to_tool_consent() {
     assert!(store(&f).verify().unwrap().ok);
     store(&f).rebuild().unwrap();
     assert!(store(&f).verify().unwrap().ok);
+}
+
+#[tokio::test]
+async fn folder_presence_tool_register_approves_fresh_cards_but_not_standing_grants() {
+    let (f, fake) = fixture(0);
+    let store = store(&f);
+    for (name, answer, expected) in [
+        ("one", Some("approve_once"), "approved"),
+        ("always", Some("approve_always_workspace"), "approved"),
+        ("standing", None, "unapproved"),
+    ] {
+        let path = f.root.join(name);
+        std::fs::create_dir_all(path.join(".git")).unwrap();
+        std::fs::write(path.join(".git/config"), "[core]\n").unwrap();
+        if let Some(answer) = answer {
+            fake.script("consent.await", Effect::Answer(answer));
+        }
+        let before = store.generation().unwrap();
+        let reply = tool_result(
+            f.call(
+                "projects_register",
+                json!({"workspace_id":"W","name":name,"dir":path,"request_key":name}),
+            )
+            .await,
+        );
+        let resolved = store.trust(path.to_str().unwrap()).unwrap();
+        assert_eq!(resolved.project_id, reply["projectId"]);
+        assert_eq!(
+            resolved.root_fields.unwrap().root_records[0].approval.state,
+            expected
+        );
+        let ops = store
+            .journal_tail(before, 10)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|row| row.op)
+            .collect::<Vec<_>>();
+        if answer.is_some() {
+            assert_eq!(ops, ["register", "bind_root", "approve_root"]);
+        } else {
+            assert_eq!(ops, ["register"]);
+        }
+    }
+    let cards = fake
+        .calls()
+        .into_iter()
+        .filter(|call| call.method == "consent.request")
+        .collect::<Vec<_>>();
+    assert_eq!(cards.len(), 2);
+    for card in cards {
+        assert!(card.params["prompt"]
+            .as_str()
+            .unwrap()
+            .ends_with(" The folder will be approved for agents on this computer."));
+    }
+    assert!(store.verify().unwrap().ok);
 }

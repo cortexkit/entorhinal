@@ -139,7 +139,7 @@ Principals in the tables:
 | Name | Meaning |
 |---|---|
 | Direct | A local client such as `ck`. Every local process, including an agent's shell, connects as Direct. |
-| executive | `reserved:prefrontal`, the module that registers repositories and relays the operator's agent changes. |
+| executive | `reserved:prefrontal`, the module that attaches worker containers and relays the operator's agent changes. |
 | orchestrator, host | The daemon's sole provider of `agent-orchestrator/v1` or `agent-host/v1`, resolved per route. |
 | any | Every caller. |
 
@@ -153,12 +153,27 @@ Tests: `writes_are_refused_unless_the_operator_or_the_executive_opened_the_route
 
 ## Projects
 
-Project mutations are admitted from Direct or the executive; anyone else gets
-`write_not_permitted`. A Direct `register`, `assign_workspace`,
-`upgrade_implicit` or `seed_import` that would carry live heads' and hirees'
-name claims into another workspace first asks for operator confirmation. Domain changes
+Most project mutations are admitted from Direct or the executive; anyone else
+gets `write_not_permitted`. `register`, `attach_root`, `add_root`, `approve_root`,
+`approve_project`, `unapprove_root`, `unapprove_project`, and `set_workspace_root`
+are Direct-only, and refuse the executive with `write_not_permitted`.
+`attach_derived_parent` remains admitted from the executive without a prompt.
+A Direct `assign_workspace`, `upgrade_implicit` or `seed_import` that would
+move active agents' name claims into another workspace first asks for operator
+confirmation. Domain changes
 have the additional confirmation rule below. [projects-and-roots.md](projects-and-roots.md) covers the
 concepts.
+
+`register`, `attach_root`, `add_root`, `approve_root`, and `approve_project`
+require one presence prompt naming the project and folders. Validation comes
+first; if the checked target changes before committing (including checkout
+replacement at the same path), the request refuses `operator_approval_stale`.
+The registration and root additions approve bound checkouts in the same local
+transaction. Neither folder approval nor checkout identity is sent to other
+machines. The replies
+include `folderApprovals` with `{root, state}` for each root and a `reason` for
+each folder left unapproved because it could not be bound. Unapproving and
+setting a workspace root do not prompt.
 
 | Operation | Kind | What it does |
 |---|---|---|
@@ -171,15 +186,15 @@ concepts.
 | `journal_tail` | query | Read the newest registry journal entries. |
 | `trust` | query | Show the project a path belongs to and each root's identity and approval. |
 | `verify` | query | Check registry invariants and replay the journal on a copy, reporting drift without writing. |
-| `register` | mutate | Register a project root under a workspace, minting its durable id. |
+| `register` | mutate | Register project roots under a workspace and approve those that can be bound. |
 | `assign_workspace` | mutate | Move a registered project to a different workspace. |
 | `set_workspace_root` | mutate | Set or clear a workspace's root directory. |
 | `set_owned_remotes` | mutate | Replace a root's owned remote names, or reset to `origin` with null. |
 | `upgrade_implicit` | mutate | Promote an implicit project to a registered one, keeping its id. |
 | `remove` | mutate | Remove a project registration; its id stops resolving. |
-| `add_root` | mutate | Add a root to a registered project; it starts unapproved. |
+| `add_root` | mutate | Add a root to a registered project and approve it if it can be bound. |
 | `refresh_root_key` | mutate | Fill a registered root's missing repository key from its current owned remotes, preserving its binding and approval. |
-| `attach_root` | mutate | Attach a local checkout to an existing project's root key; it starts unapproved. |
+| `attach_root` | mutate | Attach a local folder to an existing project's root key and approve it if it can be bound. |
 | `rebind_root` | mutate | Rebind a replaced or unbound checkout, keeping its project id; approval is still required. |
 | `remove_root` | mutate | Remove one root, retiring its binding and worker containers. |
 | `move_root_to_new_project` | mutate | Operator only, without a presence prompt: move a checkout and its recorded repository key into a newly registered project, in one shared write. |

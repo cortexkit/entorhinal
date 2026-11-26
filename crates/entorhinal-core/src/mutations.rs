@@ -37,6 +37,24 @@ pub struct RegisterRequest {
     pub actor: Option<String>,
 }
 
+impl RegisterRequest {
+    pub(crate) fn normalize(&mut self) -> Result<(), RegistryError> {
+        crate::memory::validate_domain(self.domain.as_deref())?;
+        if let Some(id) = self.project_id.as_ref().filter(|id| reserved(id)) {
+            return Err(domain("reserved_project_id_namespace", id));
+        }
+        for paths in [&mut self.roots, &mut self.derived_root_parents] {
+            *paths = paths
+                .iter()
+                .map(|p| canonical(p))
+                .collect::<Result<_, _>>()?;
+            paths.sort();
+            paths.dedup();
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AssignWorkspaceRequest {
@@ -578,7 +596,9 @@ impl super::JournalWriter<'_> {
             // An enabled root insertion also appends its local assignment row.
             // Reply generations are always the committed journal head, not the
             // earlier operation row whose response is cached.
-            let generation = if super::log_schema::log_enabled(tx)? {
+            let generation = if super::log_schema::log_enabled(tx)?
+                || action.value.get("folderApprovals").is_some()
+            {
                 tx.query_row(
                     "SELECT COALESCE(MAX(seq),0) FROM registry_journal",
                     [],
@@ -643,26 +663,7 @@ impl super::JournalWriter<'_> {
         if self.consent.is_some() {
             req.request_key = None;
         }
-        crate::memory::validate_domain(req.domain.as_deref())?;
-        if let Some(id) = req.project_id.as_ref() {
-            if reserved(id) {
-                return Err(domain("reserved_project_id_namespace", id));
-            }
-        }
-        req.roots = req
-            .roots
-            .iter()
-            .map(|p| canonical(p))
-            .collect::<Result<_, _>>()?;
-        req.derived_root_parents = req
-            .derived_root_parents
-            .iter()
-            .map(|p| canonical(p))
-            .collect::<Result<_, _>>()?;
-        req.roots.sort();
-        req.roots.dedup();
-        req.derived_root_parents.sort();
-        req.derived_root_parents.dedup();
+        req.normalize()?;
         let key = req.request_key.clone();
         self.mutation("register", key.clone().as_deref(), move |tx| {
             self.register_in(tx, &req, now, None)

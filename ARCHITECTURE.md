@@ -17,7 +17,7 @@ It owns:
 
 All traffic goes through daemon routes; entorhinal opens no network ports. The only network traffic it starts itself is HTTPS to package registries.
 
-- **prefrontal (the executive)** registers repositories, relays agent identity changes, reads `agent.changes` into its replica, registers and ends sessions as the `agent-orchestrator/v1` provider, and writes the session-liveness bus bucket entorhinal watches.
+- **prefrontal (the executive)** attaches worker containers, relays agent identity changes, reads `agent.changes` into its replica, registers and ends sessions as the `agent-orchestrator/v1` provider, and writes the session-liveness bus bucket entorhinal watches.
 - **Any module** reads project and agent identity. Magic Context keys memories on project ids and reads `context.*`; Plexus reads role claims; the apps read fleet identity and locations through Callosum.
 - **The NATS hub** hosts `HUB_IDLOG` and `KV_residence`. Envelopes are signed using the vault and sealed under the fleet epoch key. Readers verify records before applying them locally.
 - **engram** carries move data through its session door (`session-door`: `cut.*`), separate from move coordination on the hub.
@@ -76,7 +76,9 @@ Package files live outside SQLite, in a content-addressed folder beside the stor
 | Operation | Admitted from |
 |---|---|
 | Identity, project, session, location and context reads | any principal |
-| Project and workspace writes | `Direct` (the `ck` commands) or `reserved:prefrontal` |
+| `register`, `attach_root`, `add_root`, `approve_root`, `approve_project` | `Direct` after an operator presence prompt |
+| `unapprove_root`, `unapprove_project`, `set_workspace_root` | `Direct`, without a prompt |
+| Other project and workspace writes, including `attach_derived_parent` | Generally `Direct` (the `ck` commands) or `reserved:prefrontal`; see [the module surface](docs/module-surface.md#projects) for exceptions |
 | Agent identity writes | `reserved:prefrontal`, or `Direct` after an operator presence prompt |
 | Operator-only writes (enabling sharing, store adoption, splitting a root, registry and publisher trust, publishing, seeding, role takes, hire caps) | `Direct`, most after a presence prompt |
 | `agent.move` | `Direct` after a presence prompt, the `agent-orchestrator/v1` provider (which relays moves the operator starts from the phone, with no prompt here), or `reserved:engram` for a lid-close move when the operator turned those on |

@@ -91,6 +91,7 @@ pub(super) struct CardContext {
     pub target_kind: String,
     pub target_label: String,
     pub target_scope: Value,
+    pub approves_folder: bool,
 }
 
 fn always_choice(tool: &str) -> Option<&'static str> {
@@ -139,10 +140,17 @@ pub(super) fn render_card(
     }
     options.push(json!({"id":"deny", "label":"Deny", "effect":"decline"}));
     let key = external_key(&row.identity);
+    let mut prompt = format!(
+        "{} requests permission to {} {}.",
+        context.caller_label, action, context.target_label
+    );
+    if row.identity.tool == "projects_register" && context.approves_folder {
+        prompt.push_str(" The folder will be approved for agents on this computer.");
+    }
     let mut card = json!({
         "kind":"consent",
         "title":format!("{}: {} {}", context.caller_label, action, context.target_label),
-        "prompt":format!("{} requests permission to {} {}.", context.caller_label, action, context.target_label),
+        "prompt":prompt,
         "target":{"kind":context.target_kind, "label":context.target_label},
         "urgency":"high", "options":options, "default":"deny", "on_expiry":"deny",
         "material_damage":false, "late_execution":"notify_only", "expires_in_ms":CARD_LIFETIME_MS,

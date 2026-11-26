@@ -64,9 +64,8 @@ async fn call(machine: &Machine, method: &str, params: Value, route: RouteKey) -
     )
 }
 
-fn repo(rig: &IdentityRig, label: &str, remote: &str) -> String {
-    let path = rig._processes.dir.join(label);
-    fs::create_dir(&path).unwrap();
+fn repo(label: &str, remote: &str) -> String {
+    let (path, _) = crate::tests::scratch_descriptor(label);
     assert!(Command::new("git")
         .args(["init", "--quiet"])
         .current_dir(&path)
@@ -90,11 +89,7 @@ async fn hub_memory_policy_round_trips_and_rebuilds() {
         return;
     };
     let (a, b) = pair(&rig, false).await;
-    let root = repo(
-        &rig,
-        "policy-project",
-        "https://github.com/example/policy.git",
-    );
+    let root = repo("policy-project", "https://github.com/example/policy.git");
     call(&a, "register", json!({"projectId":"P","name":"Project","workspaceId":"W","roots":[root],"domain":"@example/software"}), ROUTE).await;
     apply_through(&a, &b).await;
     assert_eq!(b.store().root_count("P").unwrap(), 0);
@@ -143,6 +138,7 @@ async fn hub_memory_policy_round_trips_and_rebuilds() {
                 .last_applied_position
         );
     }
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -152,8 +148,8 @@ async fn hub_remote_project_removal_cascades_and_retires_bindings() {
     };
     let (a, b) = pair(&rig, false).await;
     let remote = "https://github.com/example/cascade.git";
-    let source = repo(&rig, "source-checkout", remote);
-    let target = repo(&rig, "follower-checkout", remote);
+    let source = repo("source-checkout", remote);
+    let target = repo("follower-checkout", remote);
     call(
         &a,
         "register",
@@ -169,8 +165,8 @@ async fn hub_remote_project_removal_cascades_and_retires_bindings() {
     )
     .await;
     apply_through(&a, &b).await;
+    assert_eq!(b.store().root_count("P").unwrap(), 0);
     call(&b, "attach_root", json!({"path":target}), ROUTE).await;
-    call(&b, "approve_root", json!({"root":target}), ROUTE).await;
     let before = call(&b, "resolve", json!({"canonicalRoot":target}), ROUTE).await;
     let record = &before["rootRecords"][0];
     assert_eq!(record["approval"]["state"], "approved");
@@ -203,6 +199,8 @@ async fn hub_remote_project_removal_cascades_and_retires_bindings() {
     apply_through(&a, &b).await;
     assert_eq!(b.store().root_count("S").unwrap(), 0);
     assert!(b.store().verify().unwrap().ok);
+    fs::remove_dir_all(source).unwrap();
+    fs::remove_dir_all(target).unwrap();
 }
 
 #[tokio::test]

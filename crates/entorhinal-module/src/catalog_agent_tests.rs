@@ -2045,7 +2045,8 @@ fn forged_commit(f: &Fixture, plan: &Value) -> entorhinal_core::agent::consent::
             arguments,
             target,
             grant_class: None,
-            scope_id: None
+            scope_id: None,
+            folder_checkout: None,
         }),
         granted: None,
         now_ms: 100,

@@ -41,7 +41,13 @@ exist.
 ck projects register my-app ~/src/my-app
 ```
 
-The project gets a new id, its root is bound and starts **unapproved**.
+The registry validates the registration before showing a presence prompt that
+names the project and folder. On confirmation the project gets its id, and
+the registry binds and approves the checkout for agents on this computer in
+the same transaction. A folder that cannot be bound (for example, it is not a
+Git checkout) is still registered; the reply reports `left unapproved` and why.
+An agent's registration tool also approves a bindable checkout when the person
+answers this call's consent card. A standing grant does not approve the folder.
 
 Verify:
 
@@ -68,12 +74,18 @@ has live agents bound to it is refused.
 ck projects approve ~/src/my-app
 ```
 
-This approves every root of the project the directory belongs to. It is
-refused unless every root is identified (`bound`): a `replaced` root refuses
-`root_replaced`, an unbound one `root_not_bound`. The text reply names each
+One presence prompt names the project and all of its roots. Approval is
+refused before prompting unless every root is identified (`bound`);
+`root_not_bound` names the root that needs repair. The text reply names each
 folder and project (`approved <root> (project <name>, <id>)`); already approved
 roots add `(unchanged)`. `unapprove` prints `unapproved` with the same folder
-and project identity.
+and project identity. Unapproving does not prompt.
+
+For confirmation-required writes, `operator_declined` means the prompt was
+declined or expired, and `operator_presence_unavailable` means the machine or
+route cannot show the prompt. `operator_approval_stale` means the project or
+checkout changed while confirmation was pending. None of these refusals
+grants folder approval.
 
 Verify: `ck projects trust ~/src/my-app` shows `approved` on every root.
 
@@ -83,10 +95,10 @@ Reverse: `ck projects unapprove ~/src/my-app`.
 
 ```sh
 ck projects add-root <project-id> ~/src/my-app-docs
-ck projects approve ~/src/my-app-docs
 ```
 
-The new root starts unapproved. Reverse:
+`add-root` requests operator confirmation and approves the new root in the same
+transaction if it can be bound. Reverse:
 `ck projects remove-root <project-id> ~/src/my-app-docs`, which retires its
 binding and any worker containers attached to it. Removing a project's last
 root is refused (`last_root`); remove the project instead.
@@ -118,11 +130,12 @@ label. To give a shared project a folder on this machine:
 
 ```sh
 ck projects attach ~/src/my-app                     # preview: matched project and key
-ck projects attach ~/src/my-app --yes               # attach (unapproved)
-ck projects approve ~/src/my-app
+ck projects attach ~/src/my-app --yes               # attach after a presence prompt
 ```
 
-A checkout with an owned GitHub remote matches the project that holds its
+`--yes` requests the write; it does not bypass operator confirmation. The
+checkout is approved on this computer if it can be bound. A checkout with an
+owned GitHub remote matches the project that holds its
 `owner/repo` key; `--project <id>` is then only a cross-check, and a different
 project refuses `root_key_conflict`. A checkout without one needs both
 `--label <L>` and `--project <id>`, naming a label key that project already

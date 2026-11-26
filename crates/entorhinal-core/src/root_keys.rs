@@ -242,7 +242,7 @@ pub struct AttachRootPreview {
     pub root_key: RootKey,
 }
 
-fn attach_match(
+pub(crate) fn attach_match(
     conn: &Connection,
     req: &AttachRootRequest,
 ) -> Result<AttachRootPreview, RegistryError> {
@@ -409,55 +409,69 @@ impl JournalWriter<'_> {
         }
         req.path = canonical(&req.path)?;
         let request_key = req.request_key.clone();
-        let actor = req.actor.clone().unwrap_or_else(|| "module".into());
         self.mutation("attach_root", request_key.as_deref(), |tx| {
-            let matched = attach_match(tx, &req)?;
-            let project = matched.project_id;
-            let key = matched.root_key;
-            if tx
-                .query_row(
-                    "SELECT 1 FROM project_root WHERE canonical_root=?1",
-                    [&req.path],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()?
-                .is_some()
-            {
-                return Ok(Action {
-                    changed: false,
-                    seq: None,
-                    value: json!({"projectId":project,"root":req.path,"rootKey":key}),
-                    payload: json!({}),
-                });
-            }
-            let binding = crate::binding::fresh_binding(&req.path, &project, &self.ids)?;
-            let payload = json!({"root":req.path,"projectId":project,"binding":binding});
-            let seq = append(
-                tx,
-                "attach_root",
-                &payload,
-                &actor,
-                request_key.as_deref(),
-                now,
-                self.principal,
-            )?;
-            replay_attach(tx, seq, &payload, now)?;
-            let mut mappings = Vec::new();
-            assign(
-                tx,
-                &project,
-                &req.path,
-                Some(key.clone()),
-                now,
-                &mut mappings,
-            )?;
-            journal_assignments(tx, mappings, &actor, now, self.principal)?;
-            Ok(Action {
-                changed: true,
-                seq: Some(seq),
+            self.attach_root_in(tx, &req, now, true)
+        })
+    }
+
+    pub(crate) fn attach_root_in(
+        &self,
+        tx: &Transaction<'_>,
+        req: &AttachRootRequest,
+        now: i64,
+        bind: bool,
+    ) -> Result<Action, RegistryError> {
+        let actor = req.actor.clone().unwrap_or_else(|| "module".into());
+        let matched = attach_match(tx, req)?;
+        let project = matched.project_id;
+        let key = matched.root_key;
+        if tx
+            .query_row(
+                "SELECT 1 FROM project_root WHERE canonical_root=?1",
+                [&req.path],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Ok(Action {
+                changed: false,
+                seq: None,
                 value: json!({"projectId":project,"root":req.path,"rootKey":key}),
-                payload,
-            })
+                payload: json!({}),
+            });
+        }
+        let binding = if bind {
+            crate::binding::fresh_binding(&req.path, &project, &self.ids)?
+        } else {
+            None
+        };
+        let payload = json!({"root":req.path,"projectId":project,"binding":binding});
+        let seq = append(
+            tx,
+            "attach_root",
+            &payload,
+            &actor,
+            req.request_key.as_deref(),
+            now,
+            self.principal,
+        )?;
+        replay_attach(tx, seq, &payload, now)?;
+        let mut mappings = Vec::new();
+        assign(
+            tx,
+            &project,
+            &req.path,
+            Some(key.clone()),
+            now,
+            &mut mappings,
+        )?;
+        journal_assignments(tx, mappings, &actor, now, self.principal)?;
+        Ok(Action {
+            changed: true,
+            seq: Some(seq),
+            value: json!({"projectId":project,"root":req.path,"rootKey":key}),
+            payload,
         })
     }
 }

@@ -22,7 +22,6 @@ pub(super) const CONFIRMABLE_METHODS: &[&str] = &[
     "project.set_domain",
     "workspace.set_document",
     "assign_workspace",
-    "register",
     "upgrade_implicit",
     "seed_import",
     "agent.repair_workspaces",
@@ -354,7 +353,7 @@ fn manifest_progress(report: &Value) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
@@ -381,7 +380,7 @@ mod tests {
     const A: &str = "agent_0000000000000001";
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    struct Yes;
+    pub(crate) struct Yes;
     #[async_trait]
     impl OperatorConfirmer for Yes {
         async fn confirm_operator(&self, _: &str, _: RouteKey) -> Result<(), OperatorConfirmError> {

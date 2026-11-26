@@ -117,6 +117,7 @@ fn context() -> CardContext {
         target_kind: "project".into(),
         target_label: "Project P".into(),
         target_scope: json!({"project_id":"P", "workspace_id":"W"}),
+        approves_folder: false,
     }
 }
 fn id(attempt: ConsentAttempt) -> String {

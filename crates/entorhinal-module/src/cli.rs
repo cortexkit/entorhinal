@@ -392,15 +392,15 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
 
   list [workspace]        projects, optionally scoped to one workspace
   resolve <dir>           which project owns a directory
-  register <name> <dir>   register a project rooted at a directory
+  register <name> <dir>   register a project and approve its checkout after confirmation
   domain <project-id> <@scope/name> | --clear
                            set or clear memory domain after operator confirmation
   remove <project>        remove a project from the registry
   add-root <project> <dir>
-                          add another root to a project (starts unapproved)
+                           add and approve another checkout after confirmation
   refresh-key <dir>        fill a missing repository key, preserving approval
   attach <path> [--project ID] [--label L] [--yes]
-                          preview the matched project/key; --yes attaches unapproved
+                           preview the matched project/key; --yes requests confirmation
   remove-root <project> <dir>
                           remove one root from a project
   move-root <dir> --to-new-project <name>
@@ -412,7 +412,7 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
                           own no remote
   owned-remotes <root> --default
                           reset ownership to origin
-  approve <dir>           approve every root of the project owning <dir>
+  approve <dir>           approve all of the project's roots after confirmation
   unapprove <dir>         withdraw that approval
   trust <dir>             show each root's identity and approval
   verify                  check the store against its journal
@@ -1673,7 +1673,8 @@ fn call(
                     | "project.set_domain"
                     | "workspace.set_document"
                     | "placement.backfill"
-            ) || super::catalog_ops::WRITES.contains(&method)
+            ) || super::CONFIRMED_FOLDER_WRITES.contains(&method)
+                || super::catalog_ops::WRITES.contains(&method)
                 || method == super::catalog_publish::PUBLISH
             {
                 eprintln!("{AGENT_WRITE_NOTICE}");
@@ -1748,11 +1749,11 @@ fn placement_call_options(method: &str) -> subc_client_rs::CallOptions {
         method,
         "assign_workspace"
             | "placement.backfill"
-            | "register"
             | "project.set_domain"
             | "workspace.set_document"
             | "move_root_to_new_project"
-    ) {
+    ) || super::CONFIRMED_FOLDER_WRITES.contains(&method)
+    {
         return subc_client_rs::CallOptions {
             timeout: Duration::from_secs(300),
             ..subc_client_rs::CallOptions::default()
@@ -1923,6 +1924,12 @@ fn render(command: &Command, value: &Value) {
             }
         }
         (Face::Projects, "rebind") => println!("{}", format_rebind(value)),
+        (Face::Projects, "register" | "add-root") => {
+            println!("project:   {}", text(&value["projectId"]));
+            for line in format_folder_approvals(value) {
+                println!("{line}");
+            }
+        }
         (Face::Projects, "verify") => println!("{}", format_verify(value)),
         (Face::Projects, "attach") => println!(
             "{}",
@@ -2197,18 +2204,37 @@ fn format_attach(value: &Value, project_name: Option<&str>, confirmed: bool) -> 
     let name = project_name
         .map(|name| format!("name:      {name}\n"))
         .unwrap_or_default();
+    let status = if confirmed {
+        let mut lines = vec!["attached".to_string()];
+        lines.extend(format_folder_approvals(value));
+        lines.join("\n")
+    } else {
+        "preview only; pass --yes to attach after operator confirmation".into()
+    };
     format!(
         "project:   {}\n{name}root key:  {}:{}\nroot:      {}\n{}",
         text(&value["projectId"]),
         text(&value["rootKey"]["kind"]),
         text(&value["rootKey"]["rootKey"]),
         text(&value["root"]),
-        if confirmed {
-            "attached (unapproved)"
-        } else {
-            "preview only; pass --yes to attach (unapproved)"
-        },
+        status,
     )
+}
+
+fn format_folder_approvals(value: &Value) -> Vec<String> {
+    value["folderApprovals"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|folder| {
+            let root = text(&folder["root"]);
+            if folder["state"] == "approved" {
+                format!("approved {root}")
+            } else {
+                format!("{root} left unapproved: {}", text(&folder["reason"]))
+            }
+        })
+        .collect()
 }
 
 fn format_project_approval(
@@ -2768,10 +2794,12 @@ mod tests {
         assert!(usage(Face::Projects).contains("refresh-key <dir>"));
     }
 
-    #[test]
-    fn attach_cli_previews_then_writes_only_with_yes_and_prints_the_same_match() {
-        use crate::{tests::log_surface_handler, Principal, RouteAdmission, WireRequest};
+    #[tokio::test]
+    async fn attach_cli_previews_then_writes_only_with_yes_and_prints_the_same_match() {
+        use crate::{tests::log_surface_handler, Principal, RouteAdmission};
         let (dir, handler, _) = log_surface_handler("attach-cli");
+        let handler =
+            handler.with_operator_confirmer(std::sync::Arc::new(crate::agent_ops::tests::Yes));
         let path = dir.join("label-checkout");
         std::fs::create_dir_all(&path).unwrap();
         let root = crate::tests::canonical_test_path(&path)
@@ -2813,12 +2841,13 @@ mod tests {
                 params,
                 json!({"path":root,"projectId":"p","label":"local","actor":"ck-projects"})
             );
-            let value: Value = serde_json::from_slice(
-                &handler
-                    .execute(WireRequest { method, params }, (120, 1))
-                    .unwrap(),
-            )
-            .unwrap();
+            let wire = serde_json::to_vec(&json!({"method":method,"params":params})).unwrap();
+            let subc_client_rs::HandlerOutcome::Response(data) =
+                handler.handle_served_request(&wire, (120, 1)).await
+            else {
+                panic!("{method} failed");
+            };
+            let value: Value = serde_json::from_slice(&data).unwrap();
             let value = unwrap_result(value).unwrap();
             let projects = json!({"projects":[{"projectId":"p","name":"move-scratch"}]});
             let project_name = project_name_from_list(&projects, &value["projectId"]).unwrap();
@@ -2834,7 +2863,7 @@ mod tests {
             if confirmed {
                 assert_eq!(value["projectId"], preview["projectId"]);
                 assert_eq!(value["rootKey"], preview["rootKey"]);
-                assert!(rendered.ends_with("attached (unapproved)"));
+                assert!(rendered.contains(&format!("{root} left unapproved:")));
                 assert!(
                     handler
                         .with_store(entorhinal_core::RegistryStore::generation)
@@ -3686,7 +3715,13 @@ mod agent_tests {
                 Duration::from_secs(300)
             )]
         );
-        for method in ["assign_workspace", "register"] {
+        for method in [
+            "assign_workspace",
+            "register",
+            "attach_root",
+            "add_root",
+            "approve_project",
+        ] {
             assert_eq!(
                 placement_call_options(method).timeout,
                 Duration::from_secs(300)

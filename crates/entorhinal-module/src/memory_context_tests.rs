@@ -14,6 +14,8 @@ const CORE: RouteKey = (502, 1);
 struct Prompt {
     summaries: Mutex<Vec<String>>,
     decline: bool,
+    unavailable: bool,
+    on_prompt: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 #[async_trait::async_trait]
 impl OperatorConfirmer for Prompt {
@@ -23,7 +25,12 @@ impl OperatorConfirmer for Prompt {
         _: RouteKey,
     ) -> Result<(), OperatorConfirmError> {
         self.summaries.lock().unwrap().push(summary.into());
-        if self.decline {
+        if let Some(f) = self.on_prompt.lock().unwrap().take() {
+            f();
+        }
+        if self.unavailable {
+            Err(OperatorConfirmError::PresenceUnavailable)
+        } else if self.decline {
             Err(OperatorConfirmError::Declined)
         } else {
             Ok(())
@@ -37,11 +44,14 @@ struct Fixture {
 }
 impl Fixture {
     fn new(decline: bool) -> Self {
-        let (dir, descriptor) = crate::tests::scratch_descriptor("memory-context");
-        let prompt = Arc::new(Prompt {
+        Self::with_prompt(Prompt {
             decline,
             ..Default::default()
-        });
+        })
+    }
+    fn with_prompt(prompt: Prompt) -> Self {
+        let (dir, descriptor) = crate::tests::scratch_descriptor("memory-context");
+        let prompt = Arc::new(prompt);
         let handler = ProjectsHandler::with_runtime("0123456789abcdef".into(), || 700)
             .with_operator_confirmer(prompt.clone());
         let store = entorhinal_core::RegistryStore::open(&descriptor).unwrap();
@@ -86,12 +96,263 @@ impl Fixture {
     fn count(&self) -> usize {
         self.prompt.summaries.lock().unwrap().len()
     }
+
+    fn store(&self) -> entorhinal_core::RegistryStore {
+        self.handler.with_store(|store| Ok(store.clone())).unwrap()
+    }
+
+    fn checkout(&self, name: &str) -> String {
+        let path = self.dir.join(name);
+        std::fs::create_dir_all(path.join(".git")).unwrap();
+        std::fs::write(path.join(".git/config"), "[core]\n").unwrap();
+        entorhinal_core::RegistryStore::canonical_mutation_root(path.to_str().unwrap()).unwrap()
+    }
+
+    fn unapproved_root(&self) -> String {
+        let root = self.checkout("checkout");
+        let store = self.store();
+        store
+            .add_root(entorhinal_core::AddRootRequest {
+                project_id: "P".into(),
+                root: root.clone(),
+                label: None,
+                actor: None,
+            })
+            .unwrap();
+        store.bind_root(&root, "fixture").unwrap();
+        root
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.handler.store.lock().unwrap().take();
         std::fs::remove_dir_all(&self.dir).unwrap();
     }
+}
+
+fn approval(store: &entorhinal_core::RegistryStore, root: &str) -> &'static str {
+    store
+        .trust(root)
+        .unwrap()
+        .root_fields
+        .unwrap()
+        .root_records
+        .into_iter()
+        .find(|record| record.root == root)
+        .unwrap()
+        .approval
+        .state
+}
+
+#[tokio::test]
+async fn folder_presence_approve_refuses_without_presence_and_plain_execute() {
+    let f = Fixture::with_prompt(Prompt {
+        unavailable: true,
+        ..Default::default()
+    });
+    let root = f.unapproved_root();
+    let store = f.store();
+    let before = store.generation().unwrap();
+    let params = json!({"root": root});
+    let unserved = f.handler.execute(
+        crate::WireRequest {
+            method: "approve_root".into(),
+            params: params.clone(),
+        },
+        DIRECT,
+    );
+    assert_eq!(unserved.unwrap_err().code, "operator_presence_unavailable");
+    assert_eq!(f.count(), 0);
+    assert_eq!(
+        f.call(DIRECT, "approve_root", params).await.unwrap_err(),
+        "operator_presence_unavailable"
+    );
+    assert_eq!(f.count(), 1);
+    assert_eq!(store.generation().unwrap(), before);
+    assert_eq!(approval(&store, &root), "unapproved");
+}
+
+#[tokio::test]
+async fn folder_presence_approve_checks_then_commits_and_unapprove_does_not_prompt() {
+    let f = Fixture::new(false);
+    let unregistered = f.checkout("unregistered");
+    let root = f.unapproved_root();
+    let store = f.store();
+    let before = store.generation().unwrap();
+    assert_eq!(
+        f.call(DIRECT, "approve_root", json!({"root":unregistered}))
+            .await
+            .unwrap_err(),
+        "root_not_bound"
+    );
+    assert_eq!(f.count(), 0);
+    assert_eq!(store.generation().unwrap(), before);
+    f.call(DIRECT, "approve_project", json!({"canonicalRoot":root}))
+        .await
+        .unwrap();
+    let summaries = f.prompt.summaries.lock().unwrap().clone();
+    assert_eq!(summaries.len(), 1);
+    assert!(summaries[0].contains("Project") && summaries[0].contains(&root));
+    assert_eq!(store.generation().unwrap(), before + 1);
+    assert_eq!(approval(&store, &root), "approved");
+    f.call(DIRECT, "unapprove_project", json!({"canonicalRoot":root}))
+        .await
+        .unwrap();
+    assert_eq!(f.count(), 1);
+    assert_eq!(approval(&store, &root), "unapproved");
+}
+
+#[tokio::test]
+async fn folder_presence_replaced_checkout_is_stale_without_journal_changes() {
+    let f = Fixture::new(false);
+    let root = f.unapproved_root();
+    let store = f.store();
+    let before = store.generation().unwrap();
+    let marker = std::path::Path::new(&root).join(".git/cortexkit-root-incarnation");
+    let original = std::fs::read_to_string(&marker).unwrap();
+    let replacement = if original.starts_with('a') { 'b' } else { 'a' };
+    *f.prompt.on_prompt.lock().unwrap() = Some(Box::new(move || {
+        std::fs::write(marker, format!("{}\n", replacement.to_string().repeat(64))).unwrap();
+    }));
+    assert_eq!(
+        f.call(DIRECT, "approve_root", json!({"root":root}))
+            .await
+            .unwrap_err(),
+        "operator_approval_stale"
+    );
+    assert_eq!(f.count(), 1);
+    assert_eq!(store.generation().unwrap(), before);
+    assert_eq!(approval(&store, &root), "unapproved");
+}
+
+#[tokio::test]
+async fn folder_presence_register_approval_is_one_transaction() {
+    let f = Fixture::new(false);
+    let root = f.checkout("new");
+    let store = f.store();
+    let before = store.generation().unwrap();
+    let params = json!({"projectId":"New","name":"New","roots":[root],"requestKey":"new"});
+    let reader = store.clone();
+    *f.prompt.on_prompt.lock().unwrap() = Some(Box::new(move || {
+        assert_eq!(reader.generation().unwrap(), before);
+    }));
+    let reply = f.call(DIRECT, "register", params.clone()).await.unwrap();
+    assert_eq!(f.count(), 1);
+    assert_eq!(reply["projectId"], "New");
+    assert_eq!(
+        reply["folderApprovals"],
+        json!([{"root":root,"state":"approved"}])
+    );
+    assert_eq!(approval(&store, &root), "approved");
+    assert_eq!(
+        store
+            .journal_tail(before, 10)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|row| row.op)
+            .collect::<Vec<_>>(),
+        ["register", "bind_root", "approve_root"]
+    );
+    assert_eq!(reply["generation"], store.generation().unwrap());
+    assert_eq!(f.call(DIRECT, "register", params).await.unwrap(), reply);
+    assert_eq!(f.count(), 1);
+    assert!(store.verify().unwrap().ok);
+    store.rebuild().unwrap();
+    assert_eq!(approval(&store, &root), "approved");
+
+    let failed = f.checkout("failed");
+    // Make approval fail after registration wrote its provisional row. A
+    // separate registration transaction would leave that row committed.
+    rusqlite::Connection::open(f.dir.join("store.db")).unwrap().execute_batch(
+        "CREATE TRIGGER fail_approval BEFORE INSERT ON root_approval BEGIN SELECT RAISE(ABORT, 'test approval failure'); END;",
+    ).unwrap();
+    let before = store.generation().unwrap();
+    assert_eq!(
+        f.call(
+            DIRECT,
+            "register",
+            json!({"projectId":"Failed","name":"Failed","roots":[failed]})
+        )
+        .await
+        .unwrap_err(),
+        "storage_error"
+    );
+    assert_eq!(store.generation().unwrap(), before);
+    assert_ne!(store.trust(&failed).unwrap().project_id, "Failed");
+}
+
+#[tokio::test]
+async fn folder_presence_register_non_git_is_confirmed_but_unapproved() {
+    let f = Fixture::new(false);
+    let root = f.dir.join("plain");
+    std::fs::create_dir(&root).unwrap();
+    let root =
+        entorhinal_core::RegistryStore::canonical_mutation_root(root.to_str().unwrap()).unwrap();
+    let store = f.store();
+    let before = store.generation().unwrap();
+    let reply = f
+        .call(DIRECT, "register", json!({"name":"Plain","roots":[root]}))
+        .await
+        .unwrap();
+    assert_eq!(f.count(), 1);
+    assert_eq!(reply["folderApprovals"][0]["root"], root);
+    assert_eq!(reply["folderApprovals"][0]["state"], "unapproved");
+    assert!(reply["folderApprovals"][0]["reason"]
+        .as_str()
+        .is_some_and(|reason| !reason.is_empty()));
+    assert_eq!(approval(&store, &root), "unapproved");
+    assert_eq!(store.generation().unwrap(), before + 1);
+}
+
+#[tokio::test]
+async fn folder_presence_prefrontal_mutation_admission_preserves_derived_parent() {
+    let f = Fixture::new(false);
+    let root = f.unapproved_root();
+    let store = f.store();
+    let before = store.generation().unwrap();
+    for method in [
+        "approve_root",
+        "unapprove_root",
+        "approve_project",
+        "unapprove_project",
+        "register",
+        "attach_root",
+        "add_root",
+        "set_workspace_root",
+    ] {
+        assert_eq!(
+            f.call(CORE, method, json!({"root":root,"canonicalRoot":root}))
+                .await
+                .unwrap_err(),
+            "write_not_permitted",
+            "{method}"
+        );
+    }
+    assert_eq!(store.generation().unwrap(), before);
+    assert_eq!(approval(&store, &root), "unapproved");
+    let container = f.dir.join("workers");
+    std::fs::create_dir(&container).unwrap();
+    let record = store
+        .trust(&root)
+        .unwrap()
+        .root_fields
+        .unwrap()
+        .root_records
+        .remove(0);
+    let params = json!({"projectId":"P","root":root,"container":container,"registrationEpoch":record.registration_epoch,"incarnation":record.incarnation.unwrap().value});
+    assert_eq!(
+        f.call(CORE, "attach_derived_parent", params.clone())
+            .await
+            .unwrap_err(),
+        "binding_unapproved"
+    );
+    assert_eq!(store.generation().unwrap(), before);
+    store.approve_root(&root, "fixture").unwrap();
+    let before = store.generation().unwrap();
+    f.call(CORE, "attach_derived_parent", params).await.unwrap();
+    assert_eq!(store.generation().unwrap(), before + 1);
+    assert_eq!(f.count(), 0);
 }
 fn document(revision: i64) -> Value {
     json!({"workspace_id":"W","expected_revision":revision,"charter":"Purpose","document":"Policy","request_key":format!("doc-{revision}")})

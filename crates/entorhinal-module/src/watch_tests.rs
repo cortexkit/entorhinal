@@ -626,7 +626,8 @@ async fn identity_live_diffs_cover_add_labels_avatar_merge_and_unchanged_rows() 
 
 #[tokio::test(start_paused = true)]
 async fn identity_project_name_workspace_name_and_root_commits_wake_full_row_diff() {
-    let f = seeded("watch-project-fields").await;
+    let mut f = seeded("watch-project-fields").await;
+    f.handler.operator_confirmer = std::sync::Arc::new(crate::agent_ops::tests::Yes);
     let body = request(IDENTITY, json!({"token":fleet(&f)["token"]}));
     let (sink, mut receiver) = Sink::new();
     let watch = f.handler.serve_watch(&sink, &body, READER);

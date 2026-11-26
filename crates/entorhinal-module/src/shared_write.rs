@@ -3,6 +3,7 @@
 
 use super::*;
 use entorhinal_core::agent::{AgentPrecheck, OperatorApproval};
+use entorhinal_core::folder_approval::{FolderPlan, FolderPrecheck, FolderWrite};
 use entorhinal_core::RegistryStore;
 use serde_json::Value;
 use std::time::Duration;
@@ -137,8 +138,16 @@ mod tests {
                 .pending_write_count
         }
         async fn call(&self, op: &str, params: Value) -> Result<Vec<u8>, HandlerError> {
+            self.call_on(ROUTE, op, params).await
+        }
+        async fn call_on(
+            &self,
+            route: RouteKey,
+            op: &str,
+            params: Value,
+        ) -> Result<Vec<u8>, HandlerError> {
             let request = serde_json::to_vec(&json!({"method":op,"params":params})).unwrap();
-            match self.handler.handle_served_request(&request, ROUTE).await {
+            match self.handler.handle_served_request(&request, route).await {
                 HandlerOutcome::Response(body) => Ok(body),
                 HandlerOutcome::Error { code, message } => Err(HandlerError {
                     code,
@@ -273,6 +282,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn local_writes_and_liveness_never_touch_engram_on_enabled_store() {
         let mut f = Fixture::new("write-local");
+        let direct = (72, 1);
+        f.handler.operator_confirmer = Arc::new(crate::agent_ops::tests::Yes);
+        f.handler.route_admissions().insert(
+            direct,
+            RouteAdmission::from_bind(Some(Principal::Direct), None),
+        );
         let resolver = crate::sessions::FakeResolver::new();
         resolver.set(
             crate::sessions::HOST_CAPABILITY,
@@ -315,27 +330,34 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        f.call("approve_root", json!({"root":root})).await.unwrap();
+        f.call_on(direct, "approve_root", json!({"root":root}))
+            .await
+            .unwrap();
         let resolved: Value =
             serde_json::from_slice(&f.handler.resolve(json!({"canonicalRoot":root})).unwrap())
                 .unwrap();
         let record = &resolved["result"]["rootRecords"][0];
         f.call("attach_derived_parent", json!({"projectId":"P","root":root,"incarnation":record["incarnation"]["value"],"registrationEpoch":record["registrationEpoch"],"container":container})).await.unwrap();
-        f.call("unapprove_root", json!({"root":root}))
+        f.call_on(direct, "unapprove_root", json!({"root":root}))
             .await
             .unwrap();
         f.call("set_owned_remotes", json!({"root":root,"remotes":[]}))
             .await
             .unwrap();
-        f.call(
+        f.call_on(
+            direct,
             "set_workspace_root",
             json!({"workspaceId":"W","root":container}),
         )
         .await
         .unwrap();
-        f.call("set_workspace_root", json!({"workspaceId":"W","root":null}))
-            .await
-            .unwrap();
+        f.call_on(
+            direct,
+            "set_workspace_root",
+            json!({"workspaceId":"W","root":null}),
+        )
+        .await
+        .unwrap();
         let lock = f.handler.writer.lock().await;
         ready(f.call(
             "agent.session_liveness",
@@ -545,11 +567,10 @@ mod tests {
         }
 
         async fn placed_head(f: &Fixture) -> String {
-            f.call(
-                "register",
+            f.handler.seed_project(
                 json!({"projectId":"P","name":"P","workspaceId":"W1","roots":[],"requestKey":"P"}),
+                "reserved:prefrontal",
             )
-            .await
             .unwrap();
             id(&f.call("agent.create", json!({"role":"head","name":"Head","tag":"ok","project_id":"P","request_key":"head"})).await.unwrap())
         }
@@ -561,7 +582,8 @@ mod tests {
                 let prompt = Prompt::new(Some(Ok(())));
                 direct(&mut f, prompt.clone());
                 write(&f, "register", json!({"projectId":"empty","name":"Empty","roots":[],"workspaceId":"W1","requestKey":"empty"})).await.unwrap();
-                assert_eq!(prompt.count(), 0);
+                assert_eq!(prompt.count(), 1);
+                prompt.calls.lock().unwrap().clear();
                 placed_head(&f).await;
                 let params = json!({"projectId":"P","workspaceId":"W2","requestKey":"carry"});
                 let committed = write(&f, "assign_workspace", params.clone()).await.unwrap();
@@ -600,11 +622,10 @@ mod tests {
             let prompt = Prompt::new(Some(Ok(())));
             direct(&mut f, prompt.clone());
             let moving = placed_head(&f).await;
-            f.call(
-                "register",
+            f.handler.seed_project(
                 json!({"projectId":"Q","name":"Q","workspaceId":"W2","roots":[],"requestKey":"Q"}),
+                "reserved:prefrontal",
             )
-            .await
             .unwrap();
             let holder = id(&f.call("agent.create", json!({"role":"head","name":"Head","tag":"ok","project_id":"Q","request_key":"holder"})).await.unwrap());
             let before = image(&f);
@@ -719,9 +740,9 @@ mod tests {
                     .await
                     .unwrap();
                 let target = id(&landed);
-                f.call("register", json!({"projectId":"P","name":"P","workspaceId":"W1","roots":[],"requestKey":"P"})).await.unwrap();
-                f.call("register", register("unplaced", "unplaced"))
-                    .await
+                f.handler.seed_project(json!({"projectId":"P","name":"P","workspaceId":"W1","roots":[],"requestKey":"P"}), "reserved:prefrontal").unwrap();
+                f.handler
+                    .seed_project(register("unplaced", "unplaced"), "reserved:prefrontal")
                     .unwrap();
                 f.call("agent.create", json!({"role":"head","name":"Head","tag":"ok","project_id":"P","request_key":"head"})).await.unwrap();
                 let lock = f.handler.writer.lock().await;
@@ -859,7 +880,7 @@ mod tests {
                 "operator_summary_too_long"
             );
             assert_eq!(prompt.count(), 1);
-            f.call("register", json!({"projectId":"P","name":"P","workspaceId":"W","roots":[],"requestKey":"project"})).await.unwrap();
+            f.handler.seed_project(json!({"projectId":"P","name":"P","workspaceId":"W","roots":[],"requestKey":"project"}), "reserved:prefrontal").unwrap();
             f.call(
                 "agent.create",
                 json!({"role":"head","name":"H","tag":"ok","project_id":"P","request_key":"H"}),
@@ -966,7 +987,7 @@ mod tests {
                 let prompt = Prompt::new(None);
                 direct(&mut f, prompt.clone());
                 let params = if change == "placement" {
-                    f.call("register", json!({"projectId":"P","name":"P","workspaceId":"W1","roots":[],"requestKey":"P"})).await.unwrap();
+                    f.handler.seed_project(json!({"projectId":"P","name":"P","workspaceId":"W1","roots":[],"requestKey":"P"}), "reserved:prefrontal").unwrap();
                     json!({"role":"head","name":"Ada","tag":"ok","project_id":"P","request_key":"direct"})
                 } else {
                     new_request("direct")
@@ -975,8 +996,8 @@ mod tests {
                 pending(waiting.as_mut());
                 assert_eq!(prompt.count(), 1);
                 // Assert completion order while the prompt is still unanswered.
-                f.call("register", register("other", "other"))
-                    .await
+                f.handler
+                    .seed_project(register("other", "other"), "reserved:prefrontal")
                     .unwrap();
                 if change == "name" {
                     f.call("agent.create", new_request("core")).await.unwrap();
@@ -1427,16 +1448,14 @@ enum Write {
         entorhinal_core::agent::consent::ConsentWrite,
         Box<entorhinal_core::agent::consent::ConsentCommit>,
     ),
-    Register(RegisterRequest),
+    Folder(FolderWrite, Option<Box<FolderPlan>>),
     Domain(entorhinal_core::SetProjectDomainRequest),
     Document(entorhinal_core::SetWorkspaceDocumentRequest),
     Assign(AssignWorkspaceRequest),
     Upgrade(UpgradeImplicitRequest),
     Remove(RemoveRequest),
     Seed(SeedImportRequest),
-    Add(entorhinal_core::AddRootRequest),
     RefreshKey(entorhinal_core::RefreshRootKeyRequest),
-    Attach(entorhinal_core::AttachRootRequest),
     MoveRoot(entorhinal_core::MoveRootToNewProjectRequest),
     Agent(String, Value),
     Member(entorhinal_core::shared_entry::MemberName),
@@ -1457,7 +1476,30 @@ impl Write {
             "workspace.set_document" => {
                 Self::Document(serde_json::from_value(params).map_err(invalid_params)?)
             }
-            "register" => Self::Register(serde_json::from_value(params).map_err(invalid_params)?),
+            "register" => Self::Folder(
+                FolderWrite::Register(serde_json::from_value(params).map_err(invalid_params)?),
+                None,
+            ),
+            "approve_root" | "approve_project" => {
+                let project = method == "approve_project";
+                let (path, actor) = if project {
+                    let req: super::ProjectApprovalParams =
+                        serde_json::from_value(params).map_err(invalid_params)?;
+                    (req.canonical_root, req.actor)
+                } else {
+                    let req: super::RootApprovalParams =
+                        serde_json::from_value(params).map_err(invalid_params)?;
+                    (req.root, req.actor)
+                };
+                Self::Folder(
+                    FolderWrite::Approve {
+                        path,
+                        actor: actor.unwrap_or_else(|| "operator".into()),
+                        project,
+                    },
+                    None,
+                )
+            }
             "assign_workspace" => {
                 Self::Assign(serde_json::from_value(params).map_err(invalid_params)?)
             }
@@ -1466,11 +1508,17 @@ impl Write {
             }
             "remove" => Self::Remove(serde_json::from_value(params).map_err(invalid_params)?),
             "seed_import" => Self::Seed(serde_json::from_value(params).map_err(invalid_params)?),
-            "add_root" => Self::Add(serde_json::from_value(params).map_err(invalid_params)?),
+            "add_root" => Self::Folder(
+                FolderWrite::Add(serde_json::from_value(params).map_err(invalid_params)?),
+                None,
+            ),
             "refresh_root_key" => {
                 Self::RefreshKey(serde_json::from_value(params).map_err(invalid_params)?)
             }
-            "attach_root" => Self::Attach(serde_json::from_value(params).map_err(invalid_params)?),
+            "attach_root" => Self::Folder(
+                FolderWrite::Attach(serde_json::from_value(params).map_err(invalid_params)?),
+                None,
+            ),
             "move_root_to_new_project" => {
                 Self::MoveRoot(serde_json::from_value(params).map_err(invalid_params)?)
             }
@@ -1509,15 +1557,13 @@ impl Write {
             }
             Self::Domain(r) => Some(r.request_key.as_str()),
             Self::Document(r) => Some(r.request_key.as_str()),
-            Self::Register(r) => r.request_key.as_deref(),
+            Self::Folder(r, _) => r.request_key(),
             Self::Assign(r) => r.request_key.as_deref(),
             Self::Upgrade(r) => r.request_key.as_deref(),
             Self::Remove(r) => r.request_key.as_deref(),
             Self::Seed(r) => r.request_key.as_deref(),
-            Self::Add(_) => None,
             Self::RefreshKey(_) => None,
             Self::MoveRoot(_) => None,
-            Self::Attach(r) => r.request_key.as_deref(),
             Self::Member(_) => None,
             Self::Pins(r) => r.request_key.as_deref(),
             Self::Agent(op, params) => {
@@ -1560,15 +1606,21 @@ impl Write {
             }
             Self::Domain(r) => writer.set_project_domain_at(r, now),
             Self::Document(r) => writer.set_workspace_document_at(r, now),
-            Self::Register(r) => writer.register_at(r, now),
+            Self::Folder(r, plan) => {
+                let plan = plan.ok_or_else(|| {
+                    HandlerError::new(
+                        "operator_presence_unavailable",
+                        "folder write requires the served operator confirmation path",
+                    )
+                })?;
+                r.commit(&writer, &plan, now)
+            }
             Self::Pins(r) => writer.catalog_set_pins(r, now),
             Self::Assign(r) => writer.assign_workspace_at(r, now),
             Self::Upgrade(r) => writer.upgrade_implicit_at(r, now),
             Self::Remove(r) => writer.remove_at(r, now),
             Self::Seed(r) => writer.seed_import_at(r, now),
-            Self::Add(r) => writer.add_root_at(r, now),
             Self::RefreshKey(r) => writer.refresh_root_key_at(r, now),
-            Self::Attach(r) => writer.attach_root_at(r, now),
             Self::MoveRoot(r) => writer.move_root_to_new_project_at(r, now),
             Self::Member(name) => {
                 return store.set_member_name(name, principal).map_err(Into::into)
@@ -1828,7 +1880,8 @@ impl ProjectsHandler {
             && matches!(admission.principal, Some(Principal::Direct))
             && (agent_ops::CONFIRMABLE_METHODS.contains(&request.method.as_str())
                 || request.method == super::user_profile::SET
-                || request.method == "placement.backfill");
+                || request.method == "placement.backfill"
+                || super::CONFIRMED_FOLDER_WRITES.contains(&request.method.as_str()));
         if request.method == "placement.backfill" {
             authorize_write(&request.method, admission.principal.as_ref())?;
         }
@@ -1987,10 +2040,10 @@ impl ProjectsHandler {
             |store| Ok(store.identity_log_status().map_err(storage_error)?.state),
         )
         .await?;
-        let prepared = if agent_write {
+        let mut prepared = if agent_write {
             consent
         } else {
-            candidate
+            (candidate || direct)
                 .then(|| Write::decode(&request.method, request.params.clone()))
                 .transpose()?
         };
@@ -2070,13 +2123,21 @@ impl ProjectsHandler {
             let method = request.method.clone();
             let params = request.params.clone();
             let clock = self.clock;
-            let precheck = hub_or_local_sql(
+            let (precheck, folder_plan) = hub_or_local_sql(
                 store.as_ref(),
                 &hub_sql,
                 early_deadline,
                 "precheck_operator_confirmation",
                 move |store| {
-                    Ok(if let Some(Write::PlacementBackfill(req)) = &check {
+                    if let Some(Write::Folder(write, _)) = &check {
+                        return Ok(match write.precheck(store, clock())? {
+                            FolderPrecheck::Cached(body) => (AgentPrecheck::Cached(body), None),
+                            FolderPrecheck::Ready(plan) => {
+                                (AgentPrecheck::Ready(plan.summary().to_owned()), Some(plan))
+                            }
+                        });
+                    }
+                    let precheck = if let Some(Write::PlacementBackfill(req)) = &check {
                         if let Some(body) = store.shared_request_cache(
                             "placement.backfill",
                             req.request_key.as_deref(),
@@ -2089,7 +2150,8 @@ impl ProjectsHandler {
                         store.precheck_user_confirmation(req)?
                     } else {
                         store.precheck_agent_confirmation(&method, params, clock())?
-                    })
+                    };
+                    Ok((precheck, None))
                 },
             )
             .await?;
@@ -2130,6 +2192,9 @@ impl ProjectsHandler {
                 }
                 budget_start = Instant::now();
                 approval = Some(OperatorApproval::new(summary));
+                if let Some(Write::Folder(_, plan)) = &mut prepared {
+                    *plan = folder_plan;
+                }
                 confirmation = Some(guard);
             }
         } else if state == "enabled" {
@@ -2327,14 +2392,6 @@ impl ProjectsHandler {
             if committed {
                 self.commits.notify_waiters();
             }
-            if request.method == "register" && store.root_records_enabled() {
-                if let Err(error) = store
-                    .with_principal(&principal)
-                    .bind_unbound_roots("entorhinal")
-                {
-                    tracing::warn!(target:"binding", "binding after confirmed register failed: {error}");
-                }
-            }
             return self.record_mutation(if request.method.starts_with("agent.") {
                 self.attach_incarnation(body)
             } else {
@@ -2401,8 +2458,8 @@ impl ProjectsHandler {
                 let avatar = saved
                     .and_then(|body| serde_json::from_value(body["row"]["avatar"].clone()).ok())
                     .or_else(|| avatar.clone());
-                let label = if let Write::Register(req) = &write {
-                    req.label.as_deref()
+                let label = if let Write::Folder(req, _) = &write {
+                    req.label()
                 } else {
                     None
                 };
@@ -2508,16 +2565,16 @@ fn preview_local(
 ) -> Result<HubPreview, HandlerError> {
     let captured = Arc::new(std::sync::Mutex::new(None));
     let slot = captured.clone();
-    let result = store.preview_hub_write(
+    let result = store.preview_hub_write_with_approvals(
         entry_id.to_owned(),
-        move |body, reply| {
-            *slot.lock().unwrap() = Some((body, reply));
+        move |body, reply, approvals| {
+            *slot.lock().unwrap() = Some((body, reply, approvals));
         },
         apply,
     );
     let preview = captured.lock().unwrap().take();
     match (preview, result) {
-        (Some((bytes, reply)), Err(_)) => {
+        (Some((bytes, reply, approvals)), Err(_)) => {
             let body = serde_json::from_slice(&bytes).map_err(invalid_params)?;
             let result = &reply["result"];
             let roots = result["projectId"].as_str().and_then(|id| {
@@ -2543,7 +2600,7 @@ fn preview_local(
             });
             Ok(HubPreview::Shared(
                 body,
-                Box::new(entorhinal_core::HubContinuation::prepare(
+                Box::new(entorhinal_core::HubContinuation::prepare_with_approvals(
                     store,
                     entry_id,
                     now,
@@ -2551,6 +2608,7 @@ fn preview_local(
                     roots,
                     label,
                     consent.cloned().map(Into::into),
+                    approvals,
                 )?),
             ))
         }

@@ -23,8 +23,8 @@ use cortexkit_store_types::StorageDescriptor;
 #[cfg(test)]
 use cortexkit_store_types::{Isolation, StorageBackend};
 use entorhinal_core::{
-    AssignWorkspaceRequest, RegisterRequest, RegistryError, RegistryStore, RemoveRequest,
-    SeedImportRequest, SetWorkspaceRootRequest, UpgradeImplicitRequest,
+    AssignWorkspaceRequest, RegistryError, RegistryStore, RemoveRequest, SeedImportRequest,
+    SetWorkspaceRootRequest, UpgradeImplicitRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -818,8 +818,16 @@ const SELF_ADMITTED_METHODS: &[&str] = &[
     permissions::SET_CAP,
 ];
 
-/// Admit project/workspace mutations from the operator (`Direct`: the `ck`
-/// commands) or executive, but unconfirmed identity mutations only from the
+const CONFIRMED_FOLDER_WRITES: &[&str] = &[
+    "approve_root",
+    "approve_project",
+    "register",
+    "attach_root",
+    "add_root",
+];
+
+/// Admit most project and workspace mutations from the operator (`Direct`)
+/// or executive, but unconfirmed identity mutations only from the
 /// executive relay. The async serving path separately confirms eligible Direct
 /// identity writes. Workspace correction is Direct-only and never executive.
 /// Enabling the shared log is an operator decision, never an executive write.
@@ -845,6 +853,12 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
     if SELF_ADMITTED_METHODS.contains(&method) {
         return Ok(());
     }
+    if CONFIRMED_FOLDER_WRITES.contains(&method) && matches!(principal, Some(Principal::Direct)) {
+        return Err(HandlerError::new(
+            "operator_presence_unavailable",
+            format!("Direct {method} requires the served operator confirmation path"),
+        ));
+    }
     if method == store_origin::ADOPT
         || method == "placement.backfill"
         || method == "move_root_to_new_project"
@@ -859,6 +873,21 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
                 "write_not_permitted",
                 format!("'{method}' is accepted only from the operator (ck); this route was opened by {}", principal_label(other)),
             )),
+        };
+    }
+    if CONFIRMED_FOLDER_WRITES.contains(&method)
+        || matches!(
+            method,
+            "unapprove_root" | "unapprove_project" | "set_workspace_root"
+        )
+    {
+        return if matches!(principal, Some(Principal::Direct)) {
+            Ok(())
+        } else {
+            Err(HandlerError::new(
+                "write_not_permitted",
+                format!("'{method}' is accepted only from the operator (ck); this route was opened by {}", principal_label(principal)),
+            ))
         };
     }
     if method == "workspace.set_document" && !matches!(principal, Some(Principal::Direct)) {
@@ -1770,17 +1799,14 @@ impl ProjectsHandler {
             }
             "enumerate" => self.enumerate(request.params),
             "journal_tail" => self.journal_tail(request.params),
-            "register" => self.register(request.params, &principal),
             "assign_workspace" => self.assign_workspace(request.params, &principal),
             "set_workspace_root" => self.set_workspace_root(request.params, &principal),
             "set_owned_remotes" => self.set_owned_remotes(request.params, &principal),
             "upgrade_implicit" => self.upgrade_implicit(request.params, &principal),
             "remove" => self.remove(request.params, &principal),
             "seed_import" => self.seed_import(request.params, &principal),
-            "add_root" => self.add_root(request.params, &principal),
             "refresh_root_key" => self.refresh_root_key(request.params, &principal),
             "rebind_root" => self.rebind_root(request.params, &principal),
-            "attach_root" => self.attach_root(request.params, &principal),
             "remove_root" => self.remove_root(request.params, &principal),
             "move_root_to_new_project" => {
                 let req = serde_json::from_value::<entorhinal_core::MoveRootToNewProjectRequest>(
@@ -1802,11 +1828,9 @@ impl ProjectsHandler {
                 Ok(reply)
             }
             "attach_derived_parent" => self.attach_derived_parent(request.params, &principal),
-            "approve_root" => self.set_root_approval(request.params, true, &principal),
-            "unapprove_root" => self.set_root_approval(request.params, false, &principal),
+            "unapprove_root" => self.unapprove_root(request.params, &principal),
             "trust" => self.trust(request.params),
-            "approve_project" => self.set_project_approval(request.params, true, &principal),
-            "unapprove_project" => self.set_project_approval(request.params, false, &principal),
+            "unapprove_project" => self.unapprove_project(request.params, &principal),
             "verify" => self.verify(),
             "rebuild" => self.rebuild(),
             permissions::LIST => self.permissions_list(request.params),
@@ -1959,12 +1983,6 @@ impl ProjectsHandler {
         self.encode_read_result(reply)
     }
 
-    fn attach_root(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
-        let request = serde_json::from_value::<entorhinal_core::AttachRootRequest>(params)
-            .map_err(invalid_params)?;
-        self.record_mutation(self.with_store(|s| s.with_principal(principal).attach_root(request)))
-    }
-
     /// `projects.enumerate` for the daemon's settings gate: the same reply as a
     /// routed `enumerate {}`, wrapped as `{op, result}`. The daemon has no route
     /// of its own, so it asks on the control channel, where only it can call.
@@ -2027,28 +2045,25 @@ impl ProjectsHandler {
         self.encode_read_result(reply)
     }
 
-    fn register(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
-        let req = serde_json::from_value::<RegisterRequest>(params).map_err(invalid_params)?;
-        let reply = self.record_mutation(self.with_store(|s| {
-            s.with_principal(principal)
-                .with_confirmation(placement_confirmation(principal, None))
-                .register(req)
-        }))?;
-        // With root records on, a newly registered root is bound at once, so
-        // it never answers as unbound. Unreadable identity leaves it unbound
-        // and authorizing nothing; the registration itself still stands.
-        self.with_store(|store| {
+    #[cfg(test)]
+    // Seed fixture state for tests that exercise other operations. Registration
+    // tests use the served path instead and check its confirmation behavior.
+    fn seed_project(&self, params: Value, principal: &str) -> Result<(), HandlerError> {
+        let req = serde_json::from_value(params).map_err(invalid_params)?;
+        let (before, after) = self.with_store(|store| {
+            let before = store.generation()?;
+            let writer = store.with_principal(principal);
+            writer.register_at(req, (self.clock)())?;
             if store.root_records_enabled() {
-                if let Err(error) = store
-                    .with_principal(principal)
-                    .bind_unbound_roots("entorhinal")
-                {
-                    tracing::warn!(target: "binding", "binding after register failed: {error}");
-                }
+                writer.bind_unbound_roots("entorhinal")?;
             }
-            Ok(())
+            Ok((before, store.generation()?))
         })?;
-        Ok(reply)
+        self.health.generation.fetch_max(after, Ordering::Relaxed);
+        if before != after {
+            self.commits.notify_waiters();
+        }
+        Ok(())
     }
     fn set_workspace_root(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req =
@@ -2081,27 +2096,6 @@ impl ProjectsHandler {
         let req = serde_json::from_value::<RemoveRequest>(params).map_err(invalid_params)?;
         self.record_mutation(self.with_store(|s| s.with_principal(principal).remove(req)))
     }
-    fn add_root(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
-        let req = serde_json::from_value::<entorhinal_core::AddRootRequest>(params)
-            .map_err(invalid_params)?;
-        let reply =
-            self.record_mutation(self.with_store(|s| s.with_principal(principal).add_root(req)))?;
-        // As after register: bind at once, so the new root never answers as
-        // unbound while root records are on. Binding never approves.
-        self.with_store(|store| {
-            if store.root_records_enabled() {
-                if let Err(error) = store
-                    .with_principal(principal)
-                    .bind_unbound_roots("entorhinal")
-                {
-                    tracing::warn!(target: "binding", "binding after add_root failed: {error}");
-                }
-            }
-            Ok(())
-        })?;
-        Ok(reply)
-    }
-
     fn refresh_root_key(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<entorhinal_core::RefreshRootKeyRequest>(params)
             .map_err(invalid_params)?;
@@ -2132,35 +2126,21 @@ impl ProjectsHandler {
             self.with_store(|s| s.with_principal(principal).attach_derived_parent(req)),
         )
     }
-    fn set_root_approval(
-        &self,
-        params: Value,
-        approve: bool,
-        principal: &str,
-    ) -> Result<Vec<u8>, HandlerError> {
+    fn unapprove_root(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<RootApprovalParams>(params).map_err(invalid_params)?;
         let actor = req.actor.unwrap_or_else(|| "operator".to_string());
         self.record_mutation(self.with_store(|s| {
-            if approve {
-                s.with_principal(principal).approve_root(&req.root, &actor)
-            } else {
-                s.with_principal(principal)
-                    .unapprove_root(&req.root, &actor)
-            }
+            s.with_principal(principal)
+                .unapprove_root(&req.root, &actor)
         }))
     }
-    fn set_project_approval(
-        &self,
-        params: Value,
-        approve: bool,
-        principal: &str,
-    ) -> Result<Vec<u8>, HandlerError> {
+    fn unapprove_project(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req =
             serde_json::from_value::<ProjectApprovalParams>(params).map_err(invalid_params)?;
         let actor = req.actor.unwrap_or_else(|| "operator".to_string());
         self.record_mutation(self.with_store(|s| {
             s.with_principal(principal)
-                .set_project_approval(&req.canonical_root, &actor, approve)
+                .set_project_approval(&req.canonical_root, &actor, false)
         }))
     }
     fn trust(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
@@ -2510,7 +2490,7 @@ fn manifest() -> ModuleManifest {
                 management_operation(
                     "register",
                     ManagementOperationKind::Mutate,
-                    "Register a project root under a workspace, minting its durable project id.",
+                    "With operator confirmation, register a project and approve roots that can be bound.",
                 ),
                 management_operation(
                     "assign_workspace",
@@ -2520,7 +2500,7 @@ fn manifest() -> ModuleManifest {
                 management_operation(
                     "set_workspace_root",
                     ManagementOperationKind::Mutate,
-                    "Set or clear a workspace's root directory (operator-set, never derived).",
+                    "Direct only: set or clear a workspace's root directory without approving it.",
                 ),
                 management_operation(
                     "set_owned_remotes",
@@ -2555,7 +2535,7 @@ fn manifest() -> ModuleManifest {
                 management_operation(
                     "add_root",
                     ManagementOperationKind::Mutate,
-                    "Add a root to a registered project; it starts unapproved.",
+                    "With operator confirmation, add a root and approve it if it can be bound.",
                 ),
                 management_operation(
                     "refresh_root_key",
@@ -2570,7 +2550,7 @@ fn manifest() -> ModuleManifest {
                 management_operation(
                     "attach_root",
                     ManagementOperationKind::Mutate,
-                    "Attach a local checkout to an existing project's root key; it starts unapproved.",
+                    "With operator confirmation, attach a local folder to a root key and approve it if it can be bound.",
                 ),
                 management_operation(
                     "remove_root",
@@ -2590,7 +2570,7 @@ fn manifest() -> ModuleManifest {
                 management_operation(
                     "approve_root",
                     ManagementOperationKind::Mutate,
-                    "Approve a root's current binding for autonomous work.",
+                    "With operator confirmation, approve a root's current binding for autonomous work.",
                 ),
                 management_operation(
                     "unapprove_root",
@@ -2600,7 +2580,7 @@ fn manifest() -> ModuleManifest {
                 management_operation(
                     "approve_project",
                     ManagementOperationKind::Mutate,
-                    "Approve every root of the project a path belongs to; refused unless all are identified.",
+                    "With operator confirmation, approve every root of a project if all are identified.",
                 ),
                 management_operation(
                     "unapprove_project",
@@ -3059,6 +3039,7 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use entorhinal_core::RegisterRequest;
 
     #[tokio::test]
     async fn request_latency_records_operation_counts_and_thresholds() {
@@ -3359,7 +3340,7 @@ mod tests {
             .filter(|method| !SELF_ADMITTED_METHODS.contains(method))
         {
             let direct = authorize_write(method, Some(&Principal::Direct));
-            if *method == user_profile::SET {
+            if *method == user_profile::SET || CONFIRMED_FOLDER_WRITES.contains(method) {
                 assert_eq!(direct.unwrap_err().code, "operator_presence_unavailable");
             } else if agent_ops::MUTATING_METHODS.contains(method) {
                 assert_eq!(
@@ -3372,6 +3353,11 @@ mod tests {
             }
             let executive = authorize_write(method, Some(&reserved(WRITER_MODULE)));
             if *method == store_origin::ADOPT
+                || CONFIRMED_FOLDER_WRITES.contains(method)
+                || matches!(
+                    *method,
+                    "unapprove_root" | "unapprove_project" | "set_workspace_root"
+                )
                 || *method == "move_root_to_new_project"
                 || *method == "identity_log.enable"
                 || *method == "placement.backfill"
@@ -3528,7 +3514,7 @@ mod tests {
             Some(&flow_stamp(Some("fl_nightly"))),
         );
         assert!(
-            authorize_write("register", admission.principal.as_ref()).is_ok(),
+            authorize_write("attach_derived_parent", admission.principal.as_ref()).is_ok(),
             "on the principal alone this write would be admitted, which is the gap"
         );
         for method in MUTATING_METHODS {
@@ -3599,7 +3585,7 @@ mod tests {
             "reads stay open"
         );
         assert!(
-            handler.admit("register", head_route).is_ok(),
+            handler.admit("attach_derived_parent", head_route).is_ok(),
             "the executive's own scoped route still writes"
         );
         assert_eq!(
@@ -3722,6 +3708,24 @@ mod tests {
             .unwrap()
     }
 
+    async fn served_on(
+        handler: &ProjectsHandler,
+        key: RouteKey,
+        method: &str,
+        params: Value,
+    ) -> Vec<u8> {
+        match handler
+            .handle_served_request(
+                &serde_json::to_vec(&json!({"method":method,"params":params})).unwrap(),
+                key,
+            )
+            .await
+        {
+            HandlerOutcome::Response(body) => body,
+            other => panic!("{method}: {other:?}"),
+        }
+    }
+
     fn ownership_handler(label: &str) -> (PathBuf, ProjectsHandler, String) {
         let (dir, descriptor) = scratch_descriptor(label);
         let root = dir.join("repo");
@@ -3810,9 +3814,9 @@ mod tests {
     #[test]
     fn the_handler_refuses_a_write_from_the_retired_prefrontal_name() {
         let (dir, handler, _) = log_surface_handler("retired-prefrontal-admission");
-        let params = json!({"path":attach_checkout(&dir, "clone"),"actor":"operator"});
+        let params = json!({"projectId":"p","workspaceId":"team","workspaceName":"Team"});
         let request = || WireRequest {
-            method: "attach_root".into(),
+            method: "assign_workspace".into(),
             params: params.clone(),
         };
         let old_route = (80, 1);
@@ -3828,7 +3832,7 @@ mod tests {
 
         let before = handler.with_store(RegistryStore::generation).unwrap();
         let Err(error) = handler.execute(request(), old_route) else {
-            panic!("the retired prefrontal name was admitted to attach_root");
+            panic!("the retired prefrontal name was admitted to assign_workspace");
         };
         assert_eq!(error.code, "write_not_permitted");
         assert_eq!(
@@ -3837,29 +3841,31 @@ mod tests {
         );
         let reply: Value =
             serde_json::from_slice(&handler.execute(request(), current_route).unwrap()).unwrap();
-        assert_eq!(reply["result"]["projectId"], "p");
+        assert_eq!(reply["result"]["workspaceId"], "team");
         drop(handler);
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn attach_surface_writes_are_attributed_only_to_direct_and_core() {
+    #[tokio::test]
+    async fn attach_surface_requires_direct_confirmation_and_attributes_journal_rows() {
         let (dir, handler, _) = log_surface_handler("attach-admission");
-        for (index, principal, label) in [
-            (0, Principal::Direct, "direct"),
-            (1, reserved(WRITER_MODULE), "reserved:prefrontal"),
-        ] {
-            let key = (70 + index, 1);
-            handler
-                .route_admissions()
-                .insert(key, RouteAdmission::from_bind(Some(principal), None));
-            let root = attach_checkout(&dir, &format!("clone-{index}"));
-            let reply: Value = serde_json::from_slice(&execute_on(
-                &handler,
+        let handler = handler.with_operator_confirmer(Arc::new(agent_ops::tests::Yes));
+        {
+            let key = (70, 1);
+            handler.route_admissions().insert(
                 key,
-                "attach_root",
-                json!({"path":root,"actor":"operator"}),
-            ))
+                RouteAdmission::from_bind(Some(Principal::Direct), None),
+            );
+            let root = attach_checkout(&dir, "clone");
+            let reply: Value = serde_json::from_slice(
+                &served_on(
+                    &handler,
+                    key,
+                    "attach_root",
+                    json!({"path":root,"actor":"operator"}),
+                )
+                .await,
+            )
             .unwrap();
             assert_eq!(reply["result"]["projectId"], "p");
             assert_eq!(
@@ -3875,7 +3881,7 @@ mod tests {
                 .find(|r| r["root"] == root)
                 .unwrap();
             assert_eq!(record["identity"], "bound");
-            assert_eq!(record["approval"]["state"], "unapproved");
+            assert_eq!(record["approval"]["state"], "approved");
             let tail = handler.with_store(|s| s.journal_tail(0, 100)).unwrap();
             let rows: Vec<_> = tail
                 .entries
@@ -3890,13 +3896,18 @@ mod tests {
                 "attachment must journal its write and key mapping"
             );
             for row in rows {
-                assert_eq!(row.principal.as_deref(), Some(label));
+                assert_eq!(row.principal.as_deref(), Some("direct"));
             }
         }
         let before = handler.with_store(RegistryStore::generation).unwrap();
-        for (index, principal) in [Some(reserved("plexus")), Some(Principal::Unverified), None]
-            .into_iter()
-            .enumerate()
+        for (index, principal) in [
+            Some(reserved("plexus")),
+            Some(reserved(WRITER_MODULE)),
+            Some(Principal::Unverified),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
         {
             let key = (80 + index as u16, 1);
             handler
@@ -4206,7 +4217,9 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn cached_mutation_retry_cannot_lower_the_health_generation() {
         let (dir, descriptor) = scratch_descriptor("health-generation");
-        let handler = ProjectsHandler::new().unwrap();
+        let handler = ProjectsHandler::new()
+            .unwrap()
+            .with_operator_confirmer(Arc::new(agent_ops::tests::Yes));
         *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
         let key = (72, 1);
         handler.route_admissions().insert(
@@ -4214,20 +4227,21 @@ mod tests {
             RouteAdmission::from_bind(Some(Principal::Direct), None),
         );
         let first_params = json!({"projectId":"first", "name":"First", "requestKey":"first-key"});
-        let first = execute_on(&handler, key, "register", first_params.clone());
-        let second = execute_on(
+        let first = served_on(&handler, key, "register", first_params.clone()).await;
+        let second = served_on(
             &handler,
             key,
             "register",
             json!({"projectId":"second", "name":"Second", "requestKey":"second-key"}),
-        );
+        )
+        .await;
         let generation = |bytes: &[u8]| {
             serde_json::from_slice::<Value>(bytes).unwrap()["result"]["generation"]
                 .as_i64()
                 .unwrap()
         };
         assert!(generation(&second) > generation(&first));
-        let retried = execute_on(&handler, key, "register", first_params);
+        let retried = served_on(&handler, key, "register", first_params).await;
         assert_eq!(retried, first);
         // Holding the store mutex cannot block the atomics-only health path.
         let guard = handler.store.lock().unwrap();
@@ -4242,43 +4256,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn requests_attribute_all_project_and_secondary_binding_rows_to_the_bound_principal() {
-        for (principal, expected) in [
-            (Principal::Direct, "direct"),
-            (reserved(WRITER_MODULE), "reserved:prefrontal"),
-        ] {
+    #[tokio::test]
+    async fn requests_attribute_all_project_and_secondary_binding_rows_to_the_bound_principal() {
+        {
+            let expected = "direct";
             let (dir, descriptor) = scratch_descriptor(expected);
             let dir = crate::tests::canonical_test_path(dir);
-            let handler = ProjectsHandler::new().unwrap();
+            let handler = ProjectsHandler::new()
+                .unwrap()
+                .with_operator_confirmer(Arc::new(agent_ops::tests::Yes));
             let mut store = RegistryStore::open(&descriptor).unwrap();
             store.set_root_records(true);
             *handler.store.lock().unwrap() = Some(store);
             let key = (71, 1);
-            handler
-                .route_admissions()
-                .insert(key, RouteAdmission::from_bind(Some(principal), None));
+            handler.route_admissions().insert(
+                key,
+                RouteAdmission::from_bind(Some(Principal::Direct), None),
+            );
             let root = journal_repo(&dir, "first");
             let second = journal_repo(&dir, "second");
             let third = journal_repo(&dir, "third");
-            execute_on(
+            served_on(
                 &handler,
                 key,
                 "register",
                 json!({"projectId":"project", "name":"Project", "roots":[root,second], "actor":"request actor", "requestKey":"register-key"}),
-            );
-            execute_on(
+            ).await;
+            served_on(
                 &handler,
                 key,
                 "add_root",
                 json!({"projectId":"project", "root":third, "actor":null}),
-            );
-            execute_on(
+            )
+            .await;
+            served_on(
                 &handler,
                 key,
                 "approve_project",
                 json!({"canonicalRoot":root}),
-            );
+            )
+            .await;
             let record = handler
                 .with_store(|s| Ok(s.trust(&root)?.root_fields.unwrap().root_records.remove(0)))
                 .unwrap();
@@ -4291,7 +4308,7 @@ mod tests {
                 json!({"projectId":"project", "root":root, "incarnation":record.incarnation.unwrap().value, "registrationEpoch":record.registration_epoch.unwrap(), "container":container}),
             );
             execute_on(&handler, key, "unapprove_root", json!({"root":root}));
-            execute_on(&handler, key, "approve_root", json!({"root":root}));
+            served_on(&handler, key, "approve_root", json!({"root":root})).await;
             execute_on(
                 &handler,
                 key,
@@ -4340,11 +4357,11 @@ mod tests {
                 [
                     "register",
                     "bind_root",
+                    "approve_root",
                     "bind_root",
+                    "approve_root",
                     "add_root",
                     "bind_root",
-                    "approve_root",
-                    "approve_root",
                     "approve_root",
                     "attach_derived_parent",
                     "unapprove_root",
@@ -4360,11 +4377,8 @@ mod tests {
                 ]
             );
             assert_eq!(rows[0].actor, "request actor");
-            assert_eq!(rows[3].actor, "module");
-            assert_eq!(
-                rows[1].actor, "entorhinal",
-                "secondary binding keeps its existing actor"
-            );
+            assert_eq!(rows[1].actor, "request actor");
+            assert_eq!(rows[5].actor, "module");
             for row in &rows {
                 assert_eq!(
                     row.principal.as_deref(),
@@ -4421,7 +4435,13 @@ mod tests {
     async fn rebind_wire_repairs_checkout_and_approve_then_succeeds() {
         for principal in [Principal::Direct, reserved(WRITER_MODULE)] {
             let (dir, handler, root) = ownership_handler("rebind-wire");
+            let handler = handler.with_operator_confirmer(Arc::new(agent_ops::tests::Yes));
             let key = (73, 1);
+            let operator = (74, 1);
+            handler.route_admissions().insert(
+                operator,
+                RouteAdmission::from_bind(Some(Principal::Direct), None),
+            );
             handler.route_admissions().insert(
                 key,
                 RouteAdmission::from_bind(Some(principal.clone()), None),
@@ -4429,12 +4449,13 @@ mod tests {
             handler
                 .with_store(|s| s.bind_root(&root, "entorhinal"))
                 .unwrap();
-            execute_on(
+            served_on(
                 &handler,
-                key,
+                operator,
                 "approve_project",
                 json!({"canonicalRoot":root}),
-            );
+            )
+            .await;
             let before = handler.with_store(|s| s.trust(&root)).unwrap();
             let old_epoch = before.root_fields.unwrap().root_records[0]
                 .registration_epoch
@@ -4498,12 +4519,13 @@ mod tests {
                 .unwrap()
                 .entries
                 .is_empty());
-            execute_on(
+            served_on(
                 &handler,
-                key,
+                operator,
                 "approve_project",
                 json!({"canonicalRoot":root}),
-            );
+            )
+            .await;
             let approved = handler.with_store(|s| s.trust(&root)).unwrap();
             assert_eq!(
                 approved.root_fields.unwrap().root_records[0].approval.state,
@@ -4573,10 +4595,12 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn startup_binding_uses_entorhinal_and_later_request_binding_uses_direct() {
+    #[tokio::test]
+    async fn startup_binding_uses_entorhinal_and_later_request_binding_uses_direct() {
         let (dir, descriptor) = scratch_descriptor("startup-principal");
-        let handler = ProjectsHandler::new().unwrap();
+        let handler = ProjectsHandler::new()
+            .unwrap()
+            .with_operator_confirmer(Arc::new(agent_ops::tests::Yes));
         let store = RegistryStore::open(&descriptor).unwrap();
         let root = journal_repo(&dir, "before-restart");
         store
@@ -4601,19 +4625,26 @@ mod tests {
             RouteAdmission::from_bind(Some(Principal::Direct), None),
         );
         let added = journal_repo(&dir, "after-restart");
-        execute_on(
+        served_on(
             &handler,
             key,
             "add_root",
             json!({"projectId":"project", "root":added}),
-        );
+        )
+        .await;
         let rows = handler
             .with_store(|s| s.journal_tail(0, 10))
             .unwrap()
             .entries;
         assert_eq!(
             rows.iter().map(|row| row.op.as_str()).collect::<Vec<_>>(),
-            ["register", "bind_root", "add_root", "bind_root"]
+            [
+                "register",
+                "bind_root",
+                "add_root",
+                "bind_root",
+                "approve_root"
+            ]
         );
         assert_eq!(
             rows.iter()
@@ -4622,6 +4653,7 @@ mod tests {
             [
                 Some("reserved:prefrontal-core"),
                 Some("entorhinal"),
+                Some("direct"),
                 Some("direct"),
                 Some("direct")
             ]

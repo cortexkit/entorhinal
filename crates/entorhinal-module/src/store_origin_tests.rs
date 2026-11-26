@@ -151,7 +151,7 @@ async fn store_origin_first_start_adopts_equal_is_normal_and_no_id_is_unchecked(
         let health = f.handler.health().await;
         assert_eq!(health.metrics.unwrap()["storeOrigin"], label);
         assert!(!f.handler.health.origin.is_foreign());
-        assert!(f.handler.admit("register", DIRECT).is_ok());
+        assert!(f.handler.admit("assign_workspace", DIRECT).is_ok());
         assert_eq!(
             f.conn()
                 .query_row("SELECT machine_id FROM store_origin", [], |r| r
@@ -320,7 +320,7 @@ async fn adopt_store_confirmed_clears_self_identity_and_readmits_writes() {
         0,
         "adoption clears the old author"
     );
-    assert!(f.handler.admit("register", DIRECT).is_ok());
+    assert!(f.handler.admit("assign_workspace", DIRECT).is_ok());
     assert_eq!(
         f.handler.health().await.metrics.unwrap()["storeOrigin"],
         "this_machine"

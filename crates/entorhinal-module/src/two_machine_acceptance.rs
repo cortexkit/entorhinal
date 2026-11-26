@@ -65,7 +65,8 @@ impl Machine {
     }
 
     fn open(descriptor: &StorageDescriptor) -> ProjectsHandler {
-        let handler = ProjectsHandler::with_runtime("acceptance".into(), || 700);
+        let handler = ProjectsHandler::with_runtime("acceptance".into(), || 700)
+            .with_operator_confirmer(std::sync::Arc::new(crate::agent_ops::tests::Yes));
         let mut store = RegistryStore::open(descriptor).unwrap();
         store.set_root_records(true);
         install_store(

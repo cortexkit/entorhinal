@@ -29,6 +29,7 @@ pub mod catalog_resolution;
 pub mod catalog_trust;
 pub mod claim_cache;
 pub mod context;
+pub mod folder_approval;
 mod memory;
 pub use memory::{SetProjectDomainRequest, SetWorkspaceDocumentRequest, WorkspaceDocument};
 pub mod enable_state;

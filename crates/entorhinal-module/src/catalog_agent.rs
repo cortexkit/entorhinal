@@ -525,6 +525,7 @@ fn preview_card(
         target_kind: "catalog_plan".into(),
         target_label: plan.plan_id.clone(),
         target_scope: json!({"operation":operation.as_str(),"target":{"plan_id":plan.plan_id,"base_pin_digest":plan.base_pin_digest,"prepared":detail}}),
+        approves_folder: false,
     };
     crate::consent::render_card(&row,&context).map_err(|e| {
         let mut e = HandlerError::from(e);
@@ -898,6 +899,7 @@ impl ProjectsHandler {
                 target,
                 grant_class: None,
                 scope_id: None,
+                folder_checkout: None,
             }
         };
         let detail: PreparedPlan = serde_json::from_value(plan.target["prepared"].clone())
@@ -957,6 +959,7 @@ impl ProjectsHandler {
                 target_kind: "catalog_plan".into(),
                 target_label: id.into(),
                 target_scope: json!({"operation":op.as_str(),"target":plan.target}),
+                approves_folder: false,
             };
             drop(store);
             let obtained = self

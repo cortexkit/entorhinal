@@ -304,6 +304,7 @@ impl ProjectsHandler {
                 target_kind: target_kind.into(),
                 target_label: target_label.into(),
                 target_scope: plan.target.clone(),
+                approves_folder: plan.approves_folder(),
             };
             let slot = std::sync::Arc::downgrade(&self.store);
             // Hold no store handle while the card waits: the wait can last

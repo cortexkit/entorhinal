@@ -460,14 +460,12 @@ mod tests {
             let path = self.root.join(id);
             std::fs::create_dir_all(&path).unwrap();
             let root = RegistryStore::canonical_mutation_root(path.to_str().unwrap()).unwrap();
-            let reply = self.ok(
-                "register",
-                json!({"projectId":id,"name":id,"roots":[root],"workspaceId":workspace}),
-            );
-            assert!(
-                reply.get("incarnation").is_none(),
-                "project mutations keep their shape"
-            );
+            self.handler
+                .seed_project(
+                    json!({"projectId":id,"name":id,"roots":[root],"workspaceId":workspace}),
+                    "reserved:prefrontal",
+                )
+                .unwrap();
             root
         }
 
@@ -941,10 +939,12 @@ mod tests {
     fn project_reads_add_only_incarnation_and_legacy_resolve_matches_the_unchanged_golden() {
         let mut f = Fixture::new(false);
         let root = f.project("pj-openai-auth", None);
-        f.ok(
-            "register",
-            json!({"projectId":"pj-openai-auth","name":"openai-auth","roots":[root]}),
-        );
+        f.handler
+            .seed_project(
+                json!({"projectId":"pj-openai-auth","name":"openai-auth","roots":[root]}),
+                "reserved:prefrontal",
+            )
+            .unwrap();
         f.project("other", None);
         let mut actual = json!({"result":f.ok("resolve", json!({"canonicalRoot":root}))});
         assert_eq!(
@@ -1769,7 +1769,20 @@ mod tests {
             let unchanged = f.ok("agent.fleet_identity", json!({"token":full["token"]}));
             fleet_keys(&unchanged, &["logPosition", "token", "unchanged"]);
             assert_eq!(unchanged["unchanged"], true);
-            f.ok(method, params);
+            match method {
+                "register" => f
+                    .handler
+                    .seed_project(params, "reserved:prefrontal")
+                    .unwrap(),
+                "approve_root" => {
+                    f.handler
+                        .with_store(|store| store.approve_root(&root, "fixture"))
+                        .unwrap();
+                }
+                _ => {
+                    f.ok(method, params);
+                }
+            }
             assert_eq!(
                 f.ok("agent.fleet_identity", json!({"token":full["token"]}))["unchanged"],
                 false,

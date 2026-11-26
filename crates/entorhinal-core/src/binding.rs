@@ -183,7 +183,7 @@ pub struct ExecutionBinding {
 
 /// Result of reading a checkout's identity from disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DiskIdentity {
+pub(crate) enum DiskIdentity {
     Token(String),
     NoToken,
     Unverifiable(String),
@@ -196,7 +196,7 @@ enum DiskIdentity {
 /// `commondir`, follow it for worktrees; otherwise the admin directory itself
 /// is the common directory, as for submodules and separate-git-dir checkouts.
 /// Missing `.git` or admin directories cannot establish repository identity.
-fn git_common_dir(root: &Path) -> Result<PathBuf, String> {
+pub(crate) fn git_common_dir(root: &Path) -> Result<PathBuf, String> {
     let dot_git = root.join(".git");
     let metadata =
         fs::metadata(&dot_git).map_err(|error| format!("{}: {error}", dot_git.display()))?;
@@ -245,7 +245,7 @@ fn is_token(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn read_token(common: &Path) -> DiskIdentity {
+pub(crate) fn read_token(common: &Path) -> DiskIdentity {
     match fs::read_to_string(common.join(INCARNATION_FILE)) {
         Ok(text) => match text
             .strip_suffix("\r\n")
@@ -456,14 +456,17 @@ fn parse_github_url(url: &str) -> Option<(String, String)> {
         .then(|| (owner.to_string(), repo.to_string()))
 }
 
-#[derive(Debug, Clone)]
-struct BindingRow {
-    project_id: String,
-    incarnation: String,
-    epoch: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BindingRow {
+    pub(crate) project_id: String,
+    pub(crate) incarnation: String,
+    pub(crate) epoch: String,
 }
 
-fn active_binding(conn: &Connection, root: &str) -> rusqlite::Result<Option<BindingRow>> {
+pub(crate) fn active_binding(
+    conn: &Connection,
+    root: &str,
+) -> rusqlite::Result<Option<BindingRow>> {
     conn.query_row(
         "SELECT project_id, incarnation, registration_epoch FROM root_binding WHERE canonical_root = ?1",
         [root],
@@ -478,7 +481,7 @@ fn active_binding(conn: &Connection, root: &str) -> rusqlite::Result<Option<Bind
     .optional()
 }
 
-fn approval_for(conn: &Connection, epoch: &str) -> rusqlite::Result<Approval> {
+pub(crate) fn approval_for(conn: &Connection, epoch: &str) -> rusqlite::Result<Approval> {
     let seq = conn
         .query_row(
             "SELECT approved_seq FROM root_approval WHERE registration_epoch = ?1",
@@ -734,6 +737,17 @@ impl PreparedBinding {
         actor: &str,
         principal: &str,
     ) -> Result<Option<(i64, Value)>, RegistryError> {
+        self.write_at(tx, project_id, actor, principal, super::now_unix_millis())
+    }
+
+    pub(crate) fn write_at(
+        &self,
+        tx: &Transaction<'_>,
+        project_id: &str,
+        actor: &str,
+        principal: &str,
+        now: i64,
+    ) -> Result<Option<(i64, Value)>, RegistryError> {
         let current = active_binding(tx, &self.root)?;
         if current.as_ref().is_some_and(|bound| {
             bound.incarnation == self.incarnation && bound.project_id == project_id
@@ -749,15 +763,7 @@ impl PreparedBinding {
         };
         let value = serde_json::to_value(&payload)
             .map_err(|error| domain("encode_failed", error.to_string()))?;
-        let seq = super::mutations::append(
-            tx,
-            "bind_root",
-            &value,
-            actor,
-            None,
-            super::now_unix_millis(),
-            principal,
-        )?;
+        let seq = super::mutations::append(tx, "bind_root", &value, actor, None, now, principal)?;
         apply_bind(tx, &payload, seq)?;
         Ok(Some((seq, value)))
     }
@@ -768,6 +774,26 @@ impl PreparedBinding {
 struct ApprovalPayload {
     canonical_root: String,
     registration_epoch: String,
+}
+
+pub(crate) fn approve_in(
+    tx: &Transaction<'_>,
+    root: &str,
+    epoch: &str,
+    actor: &str,
+    principal: &str,
+    now: i64,
+) -> Result<Option<(i64, Value)>, RegistryError> {
+    if approval_for(tx, epoch)?.journal_seq.is_some() {
+        return Ok(None);
+    }
+    let payload = json!(ApprovalPayload {
+        canonical_root: root.to_owned(),
+        registration_epoch: epoch.to_owned(),
+    });
+    let seq = super::mutations::append(tx, "approve_root", &payload, actor, None, now, principal)?;
+    replay_binding_op(tx, seq, "approve_root", &payload)?;
+    Ok(Some((seq, payload)))
 }
 
 fn apply_bind(tx: &Transaction<'_>, payload: &BindPayload, seq: i64) -> rusqlite::Result<()> {
@@ -1666,73 +1692,73 @@ impl super::JournalWriter<'_> {
         now: i64,
     ) -> Result<Vec<u8>, RegistryError> {
         request.root = super::mutations::canonical(&request.root)?;
+        self.mutation("add_root", None, |tx| self.add_root_in(tx, &request, now))
+    }
+
+    pub(crate) fn add_root_in(
+        &self,
+        tx: &Transaction<'_>,
+        request: &AddRootRequest,
+        now: i64,
+    ) -> Result<Action, RegistryError> {
         let actor = request.actor.clone().unwrap_or_else(|| "module".into());
-        self.mutation("add_root", None, move |tx| {
-            let project = &request.project_id;
-            if tx
-                .query_row(
-                    "SELECT 1 FROM project WHERE project_id = ?1",
-                    [project],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?
-                .is_none()
-            {
-                return Err(domain("not_found", project.clone()));
+        let project = &request.project_id;
+        if tx
+            .query_row(
+                "SELECT 1 FROM project WHERE project_id = ?1",
+                [project],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_none()
+        {
+            return Err(domain("not_found", project.clone()));
+        }
+        if let Some(owner) = tx
+            .query_row(
+                "SELECT project_id FROM project_root WHERE canonical_root = ?1",
+                [&request.root],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            if &owner == project {
+                let value = json!({"projectId": project, "root": request.root});
+                return Ok(Action {
+                    changed: false,
+                    seq: None,
+                    value: value.clone(),
+                    payload: value,
+                });
             }
-            if let Some(owner) = tx
-                .query_row(
-                    "SELECT project_id FROM project_root WHERE canonical_root = ?1",
-                    [&request.root],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-            {
-                if &owner == project {
-                    let value = json!({"projectId": project, "root": request.root});
-                    return Ok(Action {
-                        changed: false,
-                        seq: None,
-                        value: value.clone(),
-                        payload: value,
-                    });
-                }
-                return Err(domain(
-                    "root_conflict",
-                    format!("{} is a root of {owner}", request.root),
-                ));
-            }
-            check_root_location(tx, &request.root)?;
-            let root_key =
-                crate::root_keys::incoming(tx, project, &request.root, request.label.as_deref())?;
-            let (remotes, _) = super::ownership::root_remotes(tx, &request.root)?;
-            if let Some((repository, owner)) = repository_owner(tx, project, &remotes)? {
-                return Err(domain(
-                    "repository_owned",
-                    format!("{repository} belongs to {owner}"),
-                ));
-            }
-            let payload = serde_json::to_value(&request)
-                .map_err(|error| domain("encode_failed", error.to_string()))?;
-            let seq = super::mutations::append(
-                tx,
-                "add_root",
-                &payload,
-                &actor,
-                None,
-                now,
-                self.principal,
-            )?;
-            apply_add_root(tx, &request, now)?;
-            let mut mappings = Vec::new();
-            crate::root_keys::assign(tx, project, &request.root, root_key, now, &mut mappings)?;
-            crate::root_keys::journal_assignments(tx, mappings, &actor, now, self.principal)?;
-            Ok(Action {
-                changed: true,
-                seq: Some(seq),
-                value: json!({"projectId": project, "root": request.root}),
-                payload,
-            })
+            return Err(domain(
+                "root_conflict",
+                format!("{} is a root of {owner}", request.root),
+            ));
+        }
+        check_root_location(tx, &request.root)?;
+        let root_key =
+            crate::root_keys::incoming(tx, project, &request.root, request.label.as_deref())?;
+        let (remotes, _) = super::ownership::root_remotes(tx, &request.root)?;
+        if let Some((repository, owner)) = repository_owner(tx, project, &remotes)? {
+            return Err(domain(
+                "repository_owned",
+                format!("{repository} belongs to {owner}"),
+            ));
+        }
+        let payload = serde_json::to_value(request)
+            .map_err(|error| domain("encode_failed", error.to_string()))?;
+        let seq =
+            super::mutations::append(tx, "add_root", &payload, &actor, None, now, self.principal)?;
+        apply_add_root(tx, request, now)?;
+        let mut mappings = Vec::new();
+        crate::root_keys::assign(tx, project, &request.root, root_key, now, &mut mappings)?;
+        crate::root_keys::journal_assignments(tx, mappings, &actor, now, self.principal)?;
+        Ok(Action {
+            changed: true,
+            seq: Some(seq),
+            value: json!({"projectId": project, "root": request.root}),
+            payload,
         })
     }
 

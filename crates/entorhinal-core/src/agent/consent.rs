@@ -587,7 +587,7 @@ pub(crate) fn admit_commit(
     if commit.target.get("tool").is_some() {
         let plan: ConsentWrite = serde_json::from_value(commit.target.clone())
             .map_err(|e| AgentMutationError::new("invalid_request", e.to_string()))?;
-        let fresh = if plan.tool == "catalog_install" {
+        let mut fresh = if plan.tool == "catalog_install" {
             plan.clone()
         } else {
             prepare_write(
@@ -601,6 +601,10 @@ pub(crate) fn admit_commit(
                 _ => AgentMutationError::new("consent_stale", e.message),
             })?
         };
+        // The registration transaction checks the checkout when the person
+        // approved this call's consent card. Standing grants authorize
+        // registration, not folder approval.
+        fresh.folder_checkout.clone_from(&plan.folder_checkout);
         if fresh != plan {
             return Err(AgentMutationError::new(
                 "consent_stale",
@@ -653,6 +657,16 @@ pub struct ConsentWrite {
     pub target: Value,
     pub grant_class: Option<GrantClass>,
     pub scope_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_checkout: Option<crate::folder_approval::Checkout>,
+}
+
+impl ConsentWrite {
+    pub fn approves_folder(&self) -> bool {
+        self.folder_checkout
+            .as_ref()
+            .is_some_and(crate::folder_approval::Checkout::can_approve)
+    }
 }
 
 fn prepare_write(
@@ -823,12 +837,17 @@ fn prepare_write(
         }
         _ => unreachable!(),
     };
+    let folder_checkout = target["dir"]
+        .as_str()
+        .filter(|_| tool == "projects_register")
+        .map(crate::folder_approval::Checkout::read);
     Ok(ConsentWrite {
         tool: tool.into(),
         arguments: arguments.clone(),
         target,
         grant_class,
         scope_id,
+        folder_checkout,
     })
 }
 
@@ -921,7 +940,25 @@ impl JournalWriter<'_> {
         };
         let result = match plan.tool.as_str() {
             "projects_create_workspace" => self.create_workspace_at(crate::CreateWorkspaceRequest { workspace_id:text(&plan.target,"workspace_id")?, name:text(args,"name")? }, now).map_err(Into::into),
-            "projects_register" => self.register_at(crate::RegisterRequest { name:text(args,"name")?, roots:vec![text(&plan.target,"dir")?], workspace_id:plan.scope_id.clone(), domain:args.get("domain").and_then(Value::as_str).map(str::to_owned), ..Default::default() }, now).map_err(Into::into),
+            "projects_register" => {
+                let root = text(&plan.target,"dir")?;
+                let mut request = crate::RegisterRequest { name:text(args,"name")?, roots:vec![root.clone()], workspace_id:plan.scope_id.clone(), domain:args.get("domain").and_then(Value::as_str).map(str::to_owned), ..Default::default() };
+                let checkout = plan.folder_checkout.as_ref().filter(|_| matches!(&commit.authorization,
+                    Authorization::Card { answer, .. } if matches!(answer.as_str(), "approve_once" | "approve_always_workspace")));
+                if let Some(checkout) = checkout {
+                    request.normalize()?;
+                    if request.roots[0] != root {
+                        return Err(AgentMutationError::new("consent_stale", "the approved folder moved"));
+                    }
+                    self.mutation("register", None, |tx| {
+                        let mut action = self.register_in(tx, &request, now, None)?;
+                        crate::folder_approval::approve_registered(self, tx, &mut action, [(root.as_str(), checkout)], "module", now)?;
+                        Ok(action)
+                    }).map_err(Into::into)
+                } else {
+                    self.register_at(request, now).map_err(Into::into)
+                }
+            }
             "agents_create_head" => self.agent_mutation_with_id("agent.create", json!({"role":"head","name":args["name"],"tag":args["tag"],"project_id":plan.target["placement"]["project_id"],"request_key":commit.request.identity.request_key}), now, agent_id),
             "agents_hire" => self.agents_hire(&serde_json::from_value(args.clone()).map_err(|e| AgentMutationError::new("invalid_request", e.to_string()))?, now, agent_id),
             "agents_retire_hire" => self.agent_mutation("agent.dispose", json!({"agent_id":args["agent_id"],"request_key":commit.request.identity.request_key}), now),

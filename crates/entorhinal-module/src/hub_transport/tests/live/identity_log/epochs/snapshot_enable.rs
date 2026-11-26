@@ -325,8 +325,7 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
         image
     );
 
-    let root = rig._processes.dir.join("new-checkout");
-    fs::create_dir(&root).unwrap();
+    let (root, _) = crate::tests::scratch_descriptor("new-checkout");
     let root = root.canonicalize().unwrap();
     let req = body(
         "register",
@@ -408,6 +407,7 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
         0
     );
     assert_eq!(result(a.handle_active_request(&req, ROUTE).await), reply);
+    fs::remove_dir_all(&root).unwrap();
     for (wire, route) in [(&rename, CORE), (&profile, CORE)] {
         let outcome = a.handle_active_request(wire, route).await;
         assert!(
@@ -681,6 +681,8 @@ async fn hub_snapshot_registration_binding_recovers_after_publish_and_reports_re
     crate::hub_identity_log::wait_for_applied(&log, 2, deadline())
         .await
         .unwrap();
+    let (checkouts, _) = crate::tests::scratch_descriptor("hub-checkouts");
+    let checkouts = crate::tests::canonical_test_path(checkouts);
     for (project, replaced, conflict) in [
         ("recover", false, false),
         ("replaced", true, false),
@@ -692,7 +694,7 @@ async fn hub_snapshot_registration_binding_recovers_after_publish_and_reports_re
             }
         })
         .await;
-        let root = rig._processes.dir.canonicalize().unwrap().join(project);
+        let root = checkouts.join(project);
         git_checkout(&root);
         let req = body(
             "register",
@@ -752,12 +754,15 @@ async fn hub_snapshot_registration_binding_recovers_after_publish_and_reports_re
         })
         .await;
         let outcome = handler.handle_active_request(&req, ROUTE).await;
-        if conflict {
+        if conflict || replaced {
+            let expected = if conflict {
+                "root_conflict"
+            } else {
+                "operator_approval_stale"
+            };
+            assert!(matches!(outcome, HandlerOutcome::Error { code, .. } if code == expected));
             assert!(
-                matches!(outcome, HandlerOutcome::Error { code, .. } if code == "root_conflict")
-            );
-            assert!(
-                matches!(handler.handle_active_request(&req, ROUTE).await, HandlerOutcome::Error { code, .. } if code == "root_conflict")
+                matches!(handler.handle_active_request(&req, ROUTE).await, HandlerOutcome::Error { code, .. } if code == expected)
             );
             assert_eq!(log.sql.test_store().root_count(project).unwrap(), 0);
             assert!(log
@@ -772,26 +777,22 @@ async fn hub_snapshot_registration_binding_recovers_after_publish_and_reports_re
         }
         let reply = result(outcome);
         assert_eq!(reply["projectId"], project);
-        if replaced {
-            assert_eq!(reply["unboundRoots"], json!([root]));
-        } else {
-            let resolved = log
-                .sql
-                .test_store()
-                .resolve(root.to_str().unwrap())
-                .unwrap();
-            assert_eq!(resolved.project_id, project);
-            assert_eq!(
-                resolved.root_fields.unwrap().root_records[0].identity,
-                "bound"
-            );
-        }
+        let resolved = log
+            .sql
+            .test_store()
+            .resolve(root.to_str().unwrap())
+            .unwrap();
+        assert_eq!(resolved.project_id, project);
+        let record = &resolved.root_fields.as_ref().unwrap().root_records[0];
+        assert_eq!(record.identity, "bound");
+        assert_eq!(record.approval.state, "approved");
         assert_eq!(
             result(handler.handle_active_request(&req, ROUTE).await),
             reply
         );
         assert!(log.sql.test_store().verify().unwrap().ok);
     }
+    fs::remove_dir_all(checkouts).unwrap();
 }
 
 #[tokio::test]

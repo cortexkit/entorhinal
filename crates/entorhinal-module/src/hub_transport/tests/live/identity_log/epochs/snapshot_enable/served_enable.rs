@@ -355,7 +355,9 @@ async fn hub_catch_up_resumes_saved_enable_and_joins_disabled_store_then_applies
     };
     let snapshot: HubSnapshot = serde_json::from_str(frozen[2].as_str().unwrap()).unwrap();
     let fleet = pair_fleet(&rig);
-    let a = Machine::new(&rig, file.open(), &fleet, true, false, false);
+    let mut a = Machine::new(&rig, file.open(), &fleet, true, false, false);
+    Arc::get_mut(&mut a.handler).unwrap().operator_confirmer =
+        Arc::new(crate::agent_ops::tests::Yes);
     let b = Machine::new(
         &rig,
         store(&rig._processes, "catch-up-join"),

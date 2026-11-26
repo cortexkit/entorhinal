@@ -2,6 +2,7 @@
 //! local follow-up writes when the hub entry lands.
 
 use super::{cached, domain};
+use crate::folder_approval::HubFolderApprovals;
 use crate::{RegistryError, RegistryStore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,8 @@ pub struct HubContinuation {
     pub consent: Option<HubConsent>,
     bindings: Vec<crate::binding::PreparedBinding>,
     mappings: Vec<crate::shared_entry::RootKeyMapping>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    folder_approvals: Option<HubFolderApprovals>,
 }
 
 impl HubContinuation {
@@ -71,6 +74,20 @@ impl HubContinuation {
         roots: Option<HubRoots>,
         label: Option<&str>,
         consent: Option<HubConsent>,
+    ) -> Result<Self, RegistryError> {
+        Self::prepare_with_approvals(store, entry_id, now, reply, roots, label, consent, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_approvals(
+        store: &RegistryStore,
+        entry_id: &str,
+        now: i64,
+        reply: Value,
+        roots: Option<HubRoots>,
+        label: Option<&str>,
+        consent: Option<HubConsent>,
+        folder_approvals: Option<HubFolderApprovals>,
     ) -> Result<Self, RegistryError> {
         let mut bindings = Vec::new();
         let mut mappings = Vec::new();
@@ -91,7 +108,7 @@ impl HubContinuation {
                         root_key: key.root_key,
                     });
                 }
-                if store.root_records_enabled() {
+                if folder_approvals.is_none() && store.root_records_enabled() {
                     match store.prepare_hub_binding(root) {
                         Ok(binding) => bindings.push(binding),
                         Err(RegistryError::Domain { code, .. })
@@ -109,6 +126,7 @@ impl HubContinuation {
             consent,
             bindings,
             mappings,
+            folder_approvals,
         })
     }
 }
@@ -266,6 +284,9 @@ pub(crate) fn apply_hub_local(
         let mut reply = continuation.reply.clone();
         let mut replaced = Vec::new();
         if let Some(roots) = &continuation.roots {
+            if let Some(approvals) = &continuation.folder_approvals {
+                approvals.apply(tx, &roots.project, continuation.now, &mut seq)?;
+            }
             for binding in &continuation.bindings {
                 if present.contains(&binding.root) {
                     if let Some((bound_seq, _)) =
@@ -324,14 +345,23 @@ use std::cell::RefCell;
 struct Attempt {
     id: String,
     preview: Option<Preview>,
+    folder_approvals: Option<HubFolderApprovals>,
 }
-type Preview = Box<dyn FnOnce(Vec<u8>, Value)>;
+type Preview = Box<dyn FnOnce(Vec<u8>, Value, Option<HubFolderApprovals>)>;
 thread_local! {
     static ATTEMPT: RefCell<Option<Attempt>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn entry_id() -> Option<String> {
     ATTEMPT.with(|slot| slot.borrow().as_ref().map(|attempt| attempt.id.clone()))
+}
+
+pub(crate) fn stage_folder_approvals(approvals: HubFolderApprovals) {
+    ATTEMPT.with(|slot| {
+        if let Some(attempt) = slot.borrow_mut().as_mut() {
+            attempt.folder_approvals = Some(approvals);
+        }
+    });
 }
 
 impl RegistryStore {
@@ -374,11 +404,25 @@ impl RegistryStore {
         preview: impl FnOnce(Vec<u8>, Value) + 'static,
         operation: impl FnOnce() -> Result<Vec<u8>, E>,
     ) -> Result<Vec<u8>, E> {
+        self.preview_hub_write_with_approvals(
+            id,
+            move |entry, reply, _| preview(entry, reply),
+            operation,
+        )
+    }
+
+    pub fn preview_hub_write_with_approvals<E: From<RegistryError>>(
+        &self,
+        id: String,
+        preview: impl FnOnce(Vec<u8>, Value, Option<HubFolderApprovals>) + 'static,
+        operation: impl FnOnce() -> Result<Vec<u8>, E>,
+    ) -> Result<Vec<u8>, E> {
         ATTEMPT.with(|slot| {
             assert!(slot.borrow().is_none(), "nested shared attempt");
             *slot.borrow_mut() = Some(Attempt {
                 id,
                 preview: Some(Box::new(preview)),
+                folder_approvals: None,
             });
         });
         struct Reset;
@@ -444,7 +488,7 @@ pub(crate) fn finish(tx: &Transaction<'_>, seq: Option<i64>) -> Result<(), Regis
             .preview
             .take()
             .expect("hub preview already captured a shared write");
-        preview(entry, reply);
+        preview(entry, reply, attempt.folder_approvals.take());
         Err(domain("hub_write_preview", "shared preview rolled back"))
     })
 }
