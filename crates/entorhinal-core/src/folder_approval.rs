@@ -193,8 +193,25 @@ fn stale_on_domain(error: RegistryError) -> RegistryError {
     }
 }
 
+// Quote a folder for the presence prompt as the person would type it. Debug
+// formatting would double every Windows backslash, so only quotes and
+// control characters are escaped.
+fn quote_folder(root: &str) -> String {
+    let mut quoted = String::with_capacity(root.len() + 2);
+    quoted.push('"');
+    for c in root.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            c if c.is_control() => quoted.extend(c.escape_default()),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 fn folder_names(roots: &[String]) -> String {
-    let quoted = |root: &str| format!("{root:?}");
+    let quoted = quote_folder;
     let full = roots
         .iter()
         .map(|root| quoted(root))
@@ -220,7 +237,7 @@ fn folder_names(roots: &[String]) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            let short = format!("{suffixes} in {:?}", parent.to_string_lossy());
+            let short = format!("{suffixes} in {}", quote_folder(&parent.to_string_lossy()));
             if short.chars().count() < full.chars().count() {
                 return short;
             }
@@ -454,7 +471,7 @@ impl FolderWrite {
             summary.push_str(&folder_names(&target.roots));
         }
         for parent in &target.parents {
-            summary.push_str(&format!(" (worker container {parent:?})"));
+            summary.push_str(&format!(" (worker container {})", quote_folder(parent)));
         }
         if let Some(placement) = &placement {
             summary.push_str(&format!("; {placement}"));
@@ -697,6 +714,16 @@ mod tests {
     use crate::remote_apply::RemoteEntry;
     use crate::{HubContinuation, HubRoots};
     use std::rc::Rc;
+
+    #[test]
+    fn folder_presence_prompt_quotes_folders_as_typed() {
+        // A Windows path must read with single backslashes, on every OS.
+        assert_eq!(
+            folder_names(&[r"C:\Users\a\repo".into()]),
+            r#""C:\Users\a\repo""#
+        );
+        assert_eq!(quote_folder("a\"b\nc"), r#""a\"b\nc""#);
+    }
 
     #[test]
     fn folder_presence_hub_projects_share_identity_but_keep_approval_local() {
