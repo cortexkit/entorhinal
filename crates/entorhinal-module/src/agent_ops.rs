@@ -1363,7 +1363,20 @@ pub(crate) mod tests {
                             && !crate::SELF_ADMITTED_METHODS.contains(method)
                     })
                 {
-                    let direct_only = *method == crate::store_origin::ADOPT
+                    let confirmed_folder_write = matches!(
+                        *method,
+                        "approve_root"
+                            | "approve_project"
+                            | "register"
+                            | "attach_root"
+                            | "add_root"
+                    );
+                    let direct_only = confirmed_folder_write
+                        || matches!(
+                            *method,
+                            "unapprove_root" | "unapprove_project" | "set_workspace_root"
+                        )
+                        || *method == crate::store_origin::ADOPT
                         || *method == "placement.backfill"
                         || *method == "move_root_to_new_project"
                         || *method == "workspace.set_document"
@@ -1372,10 +1385,15 @@ pub(crate) mod tests {
                             .chain(std::iter::once(&crate::catalog_publish::PUBLISH))
                             .chain(std::iter::once(&crate::catalog_seed::SEED))
                             .any(|candidate| candidate == method);
-                    if principal == Some(Principal::Direct)
+                    if confirmed_folder_write && principal == Some(Principal::Direct) {
+                        f.refusal(CALLER, method, Value::Null, "operator_presence_unavailable");
+                    } else if principal == Some(Principal::Direct)
                         || (!direct_only && principal == Some(reserved(WRITER_MODULE)))
                     {
-                        assert!(f.handler.admit(method, CALLER).is_ok());
+                        assert!(
+                            f.handler.admit(method, CALLER).is_ok(),
+                            "{method} should be admitted from {principal:?}"
+                        );
                     } else {
                         f.refusal(
                             CALLER,

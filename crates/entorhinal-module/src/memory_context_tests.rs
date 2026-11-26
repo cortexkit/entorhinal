@@ -333,6 +333,7 @@ async fn folder_presence_prefrontal_mutation_admission_preserves_derived_parent(
     assert_eq!(approval(&store, &root), "unapproved");
     let container = f.dir.join("workers");
     std::fs::create_dir(&container).unwrap();
+    let container = crate::tests::canonical_test_path(container);
     let record = store
         .trust(&root)
         .unwrap()
