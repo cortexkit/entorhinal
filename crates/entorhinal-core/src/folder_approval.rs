@@ -196,7 +196,7 @@ fn stale_on_domain(error: RegistryError) -> RegistryError {
 // Quote a folder for the presence prompt as the person would type it. Debug
 // formatting would double every Windows backslash, so only quotes and
 // control characters are escaped.
-fn quote_folder(root: &str) -> String {
+pub(crate) fn quote_folder(root: &str) -> String {
     let mut quoted = String::with_capacity(root.len() + 2);
     quoted.push('"');
     for c in root.chars() {

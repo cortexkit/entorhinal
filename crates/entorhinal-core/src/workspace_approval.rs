@@ -187,7 +187,11 @@ impl WorkspaceRootWrite {
                 ))
             }
         };
-        let summary = format!("{action} workspace {:?}: {root:?}", before.name);
+        let summary = format!(
+            "{action} workspace {:?}: {}",
+            before.name,
+            crate::folder_approval::quote_folder(&root)
+        );
         if summary.chars().count() > crate::agent::OPERATOR_SUMMARY_LIMIT {
             return Err(domain(
                 "operator_summary_too_long",
