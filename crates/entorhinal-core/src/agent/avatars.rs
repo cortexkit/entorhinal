@@ -227,19 +227,18 @@ fn plan(
             Some(row) if row.status == "live" => {
                 // A matching after-image may have arrived through log recovery
                 // or another machine, without this machine's request-key cache.
-                // It is already done; only relabelling the same genome is a
-                // mistake, since a new type or version needs its own genome.
+                // Skip that row. A new version within the same type may reuse
+                // the genome, but a different type must use a different genome.
                 let already_applied = row.avatar.as_ref().is_some_and(|avatar| {
                     avatar.genome == entry.avatar_genome
                         && avatar.avatar_type == entry.avatar_type
                         && avatar.version == Some(entry.avatar_version)
                 });
                 if request.replace
-                    && !already_applied
-                    && row
-                        .avatar
-                        .as_ref()
-                        .is_some_and(|avatar| avatar.genome == entry.avatar_genome)
+                    && row.avatar.as_ref().is_some_and(|avatar| {
+                        avatar.genome == entry.avatar_genome
+                            && avatar.avatar_type != entry.avatar_type
+                    })
                 {
                     problems.push(format!(
                         "{id} ({}): replacement genome is identical to current genome",
@@ -559,17 +558,62 @@ mod tests {
     }
 
     #[test]
-    fn avatar_manifest_identical_replacement_is_refused() {
+    fn avatar_manifest_replace_relabels_each_version_as_a_shared_write() {
+        let f = fixture(true);
+        let a = create(&f, "Ada", "assistant", None, None);
+        let b = create(&f, "Grace", "assistant", None, None);
+        apply(&f, request(json!([entry(&a, "a"), entry(&b, "b")]), false));
+        f.store
+            .apply_entry("identity_log.enable", "{}", "test", None, |tx| {
+                tx.execute("UPDATE identity_log_state SET state='enabled'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let head = f.store.generation().unwrap();
+
+        let mut params = request(json!([entry(&a, "a"), entry(&b, "b")]), true);
+        params["request_key"] = json!("version-upgrade");
+        for entry in params["entries"].as_array_mut().unwrap() {
+            entry["avatar_version"] = json!(2);
+        }
+        assert_eq!(apply(&f, params)["applied"], 2);
+
+        let shared: Vec<Vec<u8>> = f
+            .store
+            .read(|conn| {
+                conn.prepare(
+                    "SELECT entry FROM registry_journal WHERE seq>?1 AND stream='shared' ORDER BY seq",
+                )?
+                .query_map([head], |row| row.get(0))?
+                .collect()
+            })
+            .unwrap();
+        assert_eq!(shared.len(), 2);
+        let mut expected = [(&a, "a"), (&b, "b")];
+        expected.sort_unstable_by_key(|(id, _)| *id);
+        for (bytes, (id, ch)) in shared.iter().zip(expected) {
+            let change: AgentChangeEntry = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(change.op, SET_AVATAR);
+            assert_eq!(&change.agent_id, id);
+            let avatar = StoredAgentAvatar {
+                genome: ch.repeat(32_768),
+                avatar_type: "creature.wild".into(),
+                version: Some(2),
+            };
+            assert_eq!(change.row.avatar.as_ref(), Some(&avatar));
+            assert_eq!(f.store.agent_row(id).unwrap().unwrap().avatar, Some(avatar));
+        }
+    }
+
+    #[test]
+    fn avatar_manifest_same_genome_under_a_different_type_is_refused() {
         let f = fixture(true);
         let id = create(&f, "Ada", "assistant", None, None);
         apply(&f, request(json!([entry(&id, "b")]), false));
         let mut params = request(json!([entry(&id, "b")]), true);
         params["request_key"] = json!("different-run");
         params["entries"][0]["avatar_type"] = json!("creature.classic");
-        unchanged_refusal(&f, params.clone(), "identical");
-        params["entries"][0]["avatar_type"] = json!("creature.wild");
-        params["entries"][0]["avatar_version"] = json!(2);
-        unchanged_refusal(&f, params, "identical");
+        unchanged_refusal(&f, params, "replacement genome is identical");
     }
 
     #[test]

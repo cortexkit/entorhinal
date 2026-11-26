@@ -50,6 +50,9 @@ and bidirectional control characters are refused. Labels: at most 16, each
 ck agents create Ada --role head --tag "release work" --project <project-id>
 ```
 
+New agents are seeded with a random `creature.wild` version 2 genome. Creating
+an agent does not change existing avatars.
+
 Verify: `ck agents show Ada` or `ck agents list --project <project-id>`.
 
 Reverse: `ck agents retire Ada`.
@@ -73,9 +76,9 @@ value.
 
 The avatar owner's `avatar-export --mint-genomes` tool produces a JSON array:
 each entry has exactly `agent_id`, `avatar_genome`, `avatar_type` and
-`avatar_version`. Entorhinal never derives a genome or changes the supplied
-string. `avatar_type` names the avatar type; `creature.wild` is one such type, and
-its v1 genome is 16,384 bytes (32,768 hex characters).
+`avatar_version`. Entorhinal uses the supplied genome unchanged.
+`avatar_type` names the avatar type; `creature.wild` versions 1 and 2 use the
+same 16,384-byte genome layout (32,768 hex characters).
 The type and version belong to each entry, not to the whole file.
 
 ```sh
@@ -85,11 +88,13 @@ ck agents avatars --manifest avatars.json --replace       # preview replacements
 ck agents avatars --manifest avatars.json --replace --yes # replace, one operator confirmation
 ```
 
-Seed-only is the default: existing avatars are listed as skipped, so the same
-manifest can also give newly created agents their first creature. An all-skipped
-run succeeds without a prompt or a journal entry. `--replace` overwrites every
-listed agent but refuses a genome exactly equal to that agent's current genome.
-Only full equality is refused; a wild genome may begin with its classic genome.
+Seed-only is the default: the manifest gives an avatar only to agents that lack
+one. `--replace` also updates existing avatars. If the genome, type and version
+already match, the row is skipped. A version change within the same type may
+reuse the exact genome, but a type change must use a different genome. For
+example, a longer `creature.wild` genome may use the old `creature.classic`
+genome as a prefix. An all-skipped run succeeds without a prompt or a journal
+entry.
 
 The preview lists names, old and new types/versions, and skipped agents. The
 module validates the whole manifest before any prompt, refusing unknown fields,

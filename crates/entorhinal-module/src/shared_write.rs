@@ -1633,14 +1633,14 @@ pub(super) fn draw_agent_avatar() -> Result<entorhinal_core::agent::StoredAgentA
     Ok(entorhinal_core::agent::StoredAgentAvatar {
         genome: log_client::encode_hex(&random),
         avatar_type: "creature.wild".into(),
-        version: Some(1),
+        version: Some(2),
     })
 }
 
 #[cfg(test)]
 pub(super) fn assert_wild_avatar(avatar: &Value) {
     assert_eq!(avatar["type"], "creature.wild");
-    assert_eq!(avatar["version"], 1);
+    assert_eq!(avatar["version"], 2);
     let genome = avatar["genome"]
         .as_str()
         .expect("a create must carry an avatar genome");
