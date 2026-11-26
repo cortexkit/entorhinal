@@ -1577,18 +1577,7 @@ async fn project_resolve_v1_records_roundtrip_through_project_identity() {
             request.unwrap_or_else(|error| panic!("{label}: request decode failed: {error}"));
         }
 
-        let mut reply = record["reply"].clone();
-        if let Some(workspaces) = reply
-            .pointer_mut("/result/workspaces")
-            .and_then(Value::as_array_mut)
-        {
-            // The published project-identity crate decodes but ignores workspace
-            // approval until it has a typed field for it. The served vector tests
-            // compare the full reply bytes; check the reader's existing fields here.
-            for workspace in workspaces {
-                workspace.as_object_mut().unwrap().remove("approval");
-            }
-        }
+        let reply = record["reply"].clone();
         let decoded: pid::Outcome<R> = serde_json::from_value(reply.clone())
             .unwrap_or_else(|error| panic!("{label}: reply decode failed: {error}; reply={reply}"));
         let encoded = serde_json::to_value(decoded)
@@ -2428,7 +2417,7 @@ async fn project_enumerate_workspace_approval_records_match_published_file() {
         .record(SESSION_READER, READER_MODULE, "enumerate", json!({}))
         .await;
     serde_json::from_value::<pid::Outcome<pid::EnumerateReply>>(reply.clone())
-        .expect("the published reader accepts workspace approval as an additive field");
+        .expect("the published reader decodes workspace approval");
     let workspaces = reply["result"]["workspaces"].as_array().unwrap();
     assert_eq!(workspaces.len(), 3);
     for (index, (workspace, (root, _))) in workspaces.iter().zip(&paths).enumerate() {
