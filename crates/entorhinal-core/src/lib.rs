@@ -830,7 +830,6 @@ impl RegistryStore {
                  FROM registry_journal
                   WHERE seq > ?1 AND op NOT IN ({}, '{}', '{}', 'user.set', 'store.adopt',
                      'log.migrated', 'hub.snapshot', 'hub.local_write', 'member.set_box', 'member.key', 'member.removed', 'member.admitted', '{}', '{}')
-                    AND (op != 'set_workspace_root' OR json_type(payload_json, '$.workspaceApproval') IS NULL)
                  ORDER BY seq
                  LIMIT ?2",
                 agent::change_ops_sql(),

@@ -4376,19 +4376,6 @@ mod tests {
                 json!({"workspaceId":"team", "root":dir}),
             )
             .await;
-            let StorageBackend::Sqlite { path } = &descriptor.backend else {
-                unreachable!()
-            };
-            let conn = rusqlite::Connection::open(path).unwrap();
-            let principal: String = conn
-                .query_row(
-                    "SELECT principal FROM registry_journal WHERE op='set_workspace_root'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(principal, expected);
-            drop(conn);
             execute_on(
                 &handler,
                 key,
@@ -4432,6 +4419,7 @@ mod tests {
                     "unapprove_root",
                     "unapprove_root",
                     "assign_workspace",
+                    "set_workspace_root",
                     "upgrade_implicit",
                     "remove_root",
                     "seed_import",
@@ -4471,10 +4459,11 @@ mod tests {
                     .collect::<Vec<_>>()
             );
 
+            let before_removals = handler.with_store(|s| s.generation()).unwrap();
             execute_on(&handler, key, "remove", json!({"workspaceId":"team"}));
             execute_on(&handler, key, "remove", json!({"projectId":"project"}));
             let removals = handler
-                .with_store(|s| s.journal_tail(19, 100))
+                .with_store(|s| s.journal_tail(before_removals, 100))
                 .unwrap()
                 .entries;
             assert_eq!(

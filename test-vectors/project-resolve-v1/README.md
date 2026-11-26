@@ -69,7 +69,7 @@ The implicit path id `pj-implicit1-30f9d5fcd6aa4ef2` demonstrates the derivation
 | --- | --- |
 | `enumerate-file-ids.json` | `663ea65d888ca26921449ff5bdd09a8f263ab30c3fd23e7c52517f2fde83e84b` |
 | `enumerate-root-keys.json` | `6e294e5f434cd8a4710ed7c1a5568c512ae072c3ff4e121aa12532f0ec2362fa` |
-| `enumerate-workspace-approval.json` | `22f4ac3518f4eb3e1baa515f97e15dc0e905a98301b17450aff089ef564b0375` |
+| `enumerate-workspace-approval.json` | `fc190ee10b5fe9cc63105c7e5e83598c93393a4e987ae94228b614a1f0f4071a` |
 | `enumerate.json` | `89afedb88fa4ddec219f4932df22f26ca8395022c5c1dd399e3e50c9d50b94dd` |
 | `resolve-project-id.json` | `4af3d3d6dd6b279146da2e50dd48dd507674f2806f6ac35e8f04b380bc5e901e` |
 | `resolve-remote.json` | `e0504720dc0f4a81b532fbe4e0cfa4a43d0fa1b218f703cbc3efca5387e17cba` |

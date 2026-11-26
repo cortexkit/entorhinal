@@ -190,7 +190,7 @@ async fn workspace_approval_set_refuses_without_presence_and_writes_nothing() {
 }
 
 #[tokio::test]
-async fn workspace_approval_set_and_approve_commit_in_one_row_and_retries_do_not_prompt() {
+async fn workspace_approval_set_and_approve_commit_together_and_retries_do_not_prompt() {
     let f = Fixture::new(false);
     let root = f.workspace_folder("workspace-root");
     let before = f.store().generation().unwrap();
@@ -202,9 +202,9 @@ async fn workspace_approval_set_and_approve_commit_in_one_row_and_retries_do_not
     assert_eq!(set["root"], root);
     assert_eq!(
         set["approval"],
-        json!({"journalSeq":before+1,"state":"approved"})
+        json!({"journalSeq":before+2,"state":"approved"})
     );
-    assert_eq!(set["generation"], before + 1);
+    assert_eq!(set["generation"], before + 2);
     assert_eq!(set["noop"], false);
     assert_eq!(f.workspace_approval_rows(), 1);
     assert_eq!(f.count(), 1);
@@ -228,7 +228,7 @@ async fn workspace_approval_set_and_approve_commit_in_one_row_and_retries_do_not
         .unwrap();
     assert_eq!(noop["noop"], true);
     assert_eq!(noop["approval"], set["approval"]);
-    assert_eq!(f.store().generation().unwrap(), before + 1);
+    assert_eq!(f.store().generation().unwrap(), before + 2);
 }
 
 #[tokio::test]

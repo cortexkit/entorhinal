@@ -4,10 +4,10 @@
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::mutations::{append, canonical, set_workspace_root_projection, Action};
+use crate::mutations::{append, canonical, Action};
 use crate::{
     domain, file_id, Approval, JournalWriter, RegistryError, RegistryStore, SetWorkspaceRootRequest,
 };
@@ -215,7 +215,12 @@ impl WorkspaceRootWrite {
             Self::Approve(_) => "operator",
         };
         writer.mutation(self.op(), key, |tx| {
-            let stale = || domain("operator_approval_stale", "the workspace or folder changed after operator confirmation");
+            let stale = || {
+                domain(
+                    "operator_approval_stale",
+                    "the workspace or folder changed after operator confirmation",
+                )
+            };
             let current = workspace(tx, id)?.ok_or_else(stale)?;
             if current != plan.workspace
                 || self.target(&current).is_err()
@@ -224,37 +229,76 @@ impl WorkspaceRootWrite {
                 return Err(stale());
             }
             let root_changed = current.root.as_deref() != Some(plan.root.as_str());
-            let approved_seq = current.approved_seq.filter(|_| plan.file_id.is_some() && plan.file_id == current.approved_file);
-            let changed = root_changed || if plan.file_id.is_some() {
-                approved_seq.is_none()
-            } else {
-                current.approved_seq.is_some()
-            };
-            let payload = json!({
-                "workspaceId": id,
-                "root": plan.root,
-                "workspaceApproval": {"rootChanged":root_changed, "fileId":plan.file_id, "actor":actor},
+            let mut approved_seq = current.approved_seq.filter(|_| {
+                !root_changed && plan.file_id.is_some() && plan.file_id == current.approved_file
             });
-            let seq = if changed {
-                let seq = append(tx, self.op(), &payload, actor, key, now, writer.principal)?;
-                replay(tx, seq, payload.clone(), now, crate::log_schema::log_enabled(tx)?)?;
-                Some(seq)
-            } else {
-                None
+            let needs_approval = plan.file_id.is_some() && approved_seq.is_none();
+            // A path change already clears the old approval through the root projection.
+            let needs_revocation =
+                !root_changed && plan.file_id.is_none() && current.approved_seq.is_some();
+            let changed = root_changed || needs_approval || needs_revocation;
+            let mut written = match self {
+                // Keep the set reply and its request key on the root operation,
+                // even when setting the same path only changes its approval.
+                Self::Set(req) if changed => Some(writer.write_workspace_root(tx, req, now)?),
+                _ => None,
             };
+            if needs_approval || needs_revocation {
+                let row = writer.write_workspace_approval(
+                    tx,
+                    ApprovalChange {
+                        workspace_id: id.into(),
+                        root: plan.root.clone(),
+                        file_id: plan.file_id.clone(),
+                        actor: actor.into(),
+                    },
+                    now,
+                )?;
+                if needs_approval {
+                    approved_seq = Some(row.0);
+                }
+                if written.is_none() {
+                    written = Some(row);
+                }
+            }
+            let (seq, payload) =
+                written.map_or((None, Value::Null), |(seq, payload)| (Some(seq), payload));
             let mut value = json!({
                 "workspaceId": id, "root": plan.root,
-                "approval": approval(plan.file_id.as_ref().and(seq.or(approved_seq))),
+                "approval": approval(approved_seq),
             });
             if plan.file_id.is_none() {
                 value["unapprovedReason"] = json!(FILE_ID_UNAVAILABLE);
             }
-            Ok(Action { changed, seq, value, payload })
+            Ok(Action {
+                changed,
+                seq,
+                value,
+                payload,
+            })
         })
     }
 }
 
 impl JournalWriter<'_> {
+    fn write_workspace_approval(
+        &self,
+        tx: &Transaction<'_>,
+        change: ApprovalChange,
+        now: i64,
+    ) -> Result<(i64, Value), RegistryError> {
+        let op = if change.file_id.is_some() {
+            APPROVE
+        } else {
+            UNAPPROVE
+        };
+        let payload =
+            serde_json::to_value(&change).map_err(|e| domain("encode_failed", e.to_string()))?;
+        let seq = append(tx, op, &payload, &change.actor, None, now, self.principal)?;
+        change.apply(tx, seq, now)?;
+        Ok((seq, payload))
+    }
+
     pub fn unapprove_workspace_root_at(
         &self,
         req: WorkspaceApprovalRequest,
@@ -263,30 +307,24 @@ impl JournalWriter<'_> {
         let id = req.workspace_id;
         self.mutation(UNAPPROVE, None, |tx| {
             let current = workspace(tx, &id)?.ok_or_else(|| domain("not_found", &id))?;
-            let payload = json!({
-                "workspaceId": id, "root": current.root,
-                "workspaceApproval": {"rootChanged":false, "fileId":null, "actor":"operator"},
-            });
-            let seq = if current.approved_seq.is_some() {
-                let seq = append(
+            let (seq, payload) = if let Some(root) = current
+                .root
+                .as_ref()
+                .filter(|_| current.approved_seq.is_some())
+            {
+                let (seq, payload) = self.write_workspace_approval(
                     tx,
-                    UNAPPROVE,
-                    &payload,
-                    "operator",
-                    None,
+                    ApprovalChange {
+                        workspace_id: id.clone(),
+                        root: root.clone(),
+                        file_id: None,
+                        actor: "operator".into(),
+                    },
                     now,
-                    self.principal,
                 )?;
-                replay(
-                    tx,
-                    seq,
-                    payload.clone(),
-                    now,
-                    crate::log_schema::log_enabled(tx)?,
-                )?;
-                Some(seq)
+                (Some(seq), payload)
             } else {
-                None
+                (None, Value::Null)
             };
             let mut value = json!({"workspaceId":id, "root":current.root});
             if current.root.is_some() {
@@ -302,20 +340,33 @@ impl JournalWriter<'_> {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApprovalChange {
     workspace_id: String,
     root: String,
-    workspace_approval: AfterImage,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AfterImage {
-    root_changed: bool,
     file_id: Option<String>,
     actor: String,
+}
+
+impl ApprovalChange {
+    fn apply(&self, tx: &Transaction<'_>, seq: i64, now: i64) -> rusqlite::Result<()> {
+        if let Some(file_id) = &self.file_id {
+            tx.execute(
+            "INSERT INTO workspace_root_approval(workspace_id,root,file_id,journal_seq,actor,approved_at)
+             VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(workspace_id) DO UPDATE SET root=excluded.root,file_id=excluded.file_id,
+                journal_seq=excluded.journal_seq,actor=excluded.actor,approved_at=excluded.approved_at",
+                params![self.workspace_id, self.root, file_id, seq, self.actor, now],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM workspace_root_approval WHERE workspace_id=?1",
+                [&self.workspace_id],
+            )?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn replay(
@@ -323,31 +374,10 @@ pub(crate) fn replay(
     seq: i64,
     payload: Value,
     now: i64,
-    enabled: bool,
 ) -> rusqlite::Result<()> {
-    let ApprovalChange {
-        workspace_id,
-        root,
-        workspace_approval: change,
-    } = serde_json::from_value(payload).map_err(crate::shared_entry::decode_error)?;
-    if change.root_changed {
-        set_workspace_root_projection(tx, &workspace_id, Some(&root), now, enabled)?;
-    }
-    if let Some(file_id) = change.file_id {
-        tx.execute(
-            "INSERT INTO workspace_root_approval(workspace_id,root,file_id,journal_seq,actor,approved_at)
-             VALUES(?1,?2,?3,?4,?5,?6)
-             ON CONFLICT(workspace_id) DO UPDATE SET root=excluded.root,file_id=excluded.file_id,
-                journal_seq=excluded.journal_seq,actor=excluded.actor,approved_at=excluded.approved_at",
-            params![workspace_id, root, file_id, seq, change.actor, now],
-        )?;
-    } else {
-        tx.execute(
-            "DELETE FROM workspace_root_approval WHERE workspace_id=?1",
-            [&workspace_id],
-        )?;
-    }
-    Ok(())
+    let change: ApprovalChange =
+        serde_json::from_value(payload).map_err(crate::shared_entry::decode_error)?;
+    change.apply(tx, seq, now)
 }
 
 #[cfg(test)]
@@ -471,6 +501,43 @@ mod tests {
     }
 
     #[test]
+    fn workspace_approval_set_preserves_the_legacy_journal_tail_entry() {
+        let unapproved = fixture();
+        let approved = fixture();
+        let req = SetWorkspaceRootRequest {
+            request_key: Some("set-root".into()),
+            ..set_request(Some(unapproved.dir("folder")))
+        };
+        let before = approved.store.generation().unwrap();
+        unapproved
+            .store
+            .with_principal("direct")
+            .set_workspace_root_at(req.clone(), 41)
+            .unwrap();
+        let reply = confirmed(&approved.store, WorkspaceRootWrite::Set(req));
+
+        let legacy = unapproved.store.journal_tail(before, 100).unwrap();
+        let mut tail = approved.store.journal_tail(before, 100).unwrap();
+        assert_eq!(
+            tail.entries.len(),
+            1,
+            "the visible row must be the root change, not approval"
+        );
+        assert_eq!(tail.entries[0].op, SET);
+        tail.entries[0].seq = legacy.entries[0].seq;
+        tail.entries[0].created_at = legacy.entries[0].created_at;
+        assert_eq!(
+            serde_json::to_vec(&tail.entries).unwrap(),
+            serde_json::to_vec(&legacy.entries).unwrap()
+        );
+        assert_eq!(
+            reply["approval"],
+            json!({"journalSeq":before+2,"state":"approved"})
+        );
+        assert_eq!(tail.generation, before + 2);
+    }
+
+    #[test]
     fn workspace_approval_never_enters_shared_log_or_agent_feeds() {
         let f = fixture();
         f.store
@@ -498,14 +565,15 @@ mod tests {
         }).unwrap();
         assert_eq!(
             rows,
-            [SET, UNAPPROVE, APPROVE].map(|op| (op.into(), "local".into(), true))
+            [SET, APPROVE, UNAPPROVE, APPROVE].map(|op| (op.into(), "local".into(), true))
         );
         let tail = f.store.journal_tail(before, 100).unwrap();
-        assert!(tail.entries.is_empty());
-        assert_eq!(tail.generation, before + 3);
+        assert_eq!(tail.entries.len(), 1);
+        assert_eq!(tail.entries[0].op, SET);
+        assert_eq!(tail.generation, before + 4);
         let changes = f.store.agent_changes(before, Some(100)).unwrap();
         assert!(changes.entries.is_empty());
-        assert_eq!(changes.cursor, before + 3);
+        assert_eq!(changes.cursor, before + 4);
         assert!(f.store.verify().unwrap().ok);
     }
 }

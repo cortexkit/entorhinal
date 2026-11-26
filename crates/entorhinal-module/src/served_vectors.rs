@@ -2427,7 +2427,7 @@ async fn project_enumerate_workspace_approval_records_match_published_file() {
             assert_ne!(replaced_id.as_deref(), Some(file_id.as_str()));
         }
         let expected = if index == 0 {
-            json!({"state":"approved","journalSeq":2})
+            json!({"state":"approved","journalSeq":3})
         } else {
             json!({"state":"unapproved","journalSeq":null})
         };
