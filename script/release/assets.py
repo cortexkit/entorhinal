@@ -14,7 +14,7 @@ from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 
 
 BINARY = "ck-entorhinal"
-TARGETS = ("darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64", "windows-x64")
+TARGETS = ("darwin-arm64", "linux-x64", "linux-arm64", "windows-x64", "windows-arm64")
 TRIPLET = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
 
 
@@ -120,10 +120,8 @@ def assemble(args):
             archive_member(archive, target)
             if archive.testzip() is not None:
                 raise ValueError(f"{path}: ZIP integrity check failed")
-        # Verify all targets even if publication of Windows assets is disabled.
-        if target != "windows-x64" or args.dry_run or args.publish_windows:
-            shutil.copyfile(path, args.output / path.name)
-            shutil.copyfile(sidecar, args.output / sidecar.name)
+        shutil.copyfile(path, args.output / path.name)
+        shutil.copyfile(sidecar, args.output / sidecar.name)
 
     # ck setup looks for reports in --version, not in --manifest.
     manifest: dict[str, object] = {"binaries": {BINARY: {"reports": args.version}}}
@@ -154,7 +152,6 @@ def main():
     assembly.add_argument("output", type=Path)
     assembly.add_argument("version")
     assembly.add_argument("--dry-run", action="store_true")
-    assembly.add_argument("--publish-windows", action="store_true")
     commands.add_parser("check-floor")
     args = parser.parse_args()
     try:

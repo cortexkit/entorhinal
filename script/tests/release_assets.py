@@ -17,7 +17,7 @@ from script.release import assets
 REVISION = "a" * 40
 VERSION = "0.1.0"
 BINARY = "ck-entorhinal"
-TARGETS = ("darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64", "windows-x64")
+TARGETS = ("darwin-arm64", "linux-x64", "linux-arm64", "windows-x64", "windows-arm64")
 
 
 class ReleaseAssets(unittest.TestCase):
@@ -93,7 +93,7 @@ else:
 
     def make_inventory(self):
         for target in TARGETS:
-            name = BINARY + (".exe" if target == "windows-x64" else "")
+            name = BINARY + (".exe" if target.startswith("windows-") else "")
             if target == "linux-x64":
                 self.build_fixture()
             else:
@@ -107,9 +107,9 @@ else:
             digest = hashlib.sha256(archive.read_bytes()).hexdigest()
             archive.with_suffix(".zip.sha256").write_bytes(f"{digest}  {archive.name}\n".encode())
 
-    def assemble(self, output, *, dry_run=False, publish_windows=True):
+    def assemble(self, output, *, dry_run=False):
         assets.assemble(argparse.Namespace(directory=self.built, output=output, version=VERSION,
-                                            dry_run=dry_run, publish_windows=publish_windows))
+                                            dry_run=dry_run))
 
     def test_rehearsal_and_release_keep_all_targets_but_release_needs_a_floor(self):
         self.make_inventory()
@@ -120,7 +120,7 @@ else:
                 with self.assertRaisesRegex(ValueError, "ENTORHINAL_REQUIRES_CORE must be set"):
                     self.assemble(release)
         with patch.dict(os.environ, {"ENTORHINAL_REQUIRES_CORE": ""}):
-            self.assemble(dry, dry_run=True, publish_windows=False)
+            self.assemble(dry, dry_run=True)
         with patch.dict(os.environ, {"ENTORHINAL_REQUIRES_CORE": "1.2.3"}):
             self.assemble(release)
         manifest = {"binaries": {BINARY: {"reports": VERSION}}}
@@ -128,8 +128,9 @@ else:
         self.assertEqual(json.loads((dry / "release-manifest.json").read_text()), manifest)
         self.assertEqual(published, {**manifest, "requires_core": "1.2.3"})
         expected = {f"ck-entorhinal-{target}.zip{suffix}" for target in TARGETS for suffix in ("", ".sha256")}
-        self.assertEqual({p.name for p in dry.glob("*.zip*")}, expected)
-        self.assertEqual({p.name for p in release.glob("*.zip*")}, expected)
+        expected.add("release-manifest.json")
+        self.assertEqual({p.name for p in dry.iterdir()}, expected)
+        self.assertEqual({p.name for p in release.iterdir()}, expected)
 
         with ZipFile(release / "ck-entorhinal-linux-x64.zip") as zipped:
             executable = Path(zipped.extract(BINARY, self.root / "unpacked"))
@@ -144,10 +145,20 @@ else:
             with self.assertRaisesRegex(ValueError, "wrong asset inventory.*ck-projects-linux-x64.zip"):
                 self.assemble(self.root / "release")
 
-    def test_assembly_refuses_corrupt_windows_archive_even_if_withheld(self):
+    def test_assembly_refuses_legacy_inventory_without_windows_arm64(self):
         self.make_inventory()
-        archive = self.built / "ck-entorhinal-windows-x64.zip"
-        archive.write_bytes(b"not the archived binary")
+        for suffix in (".zip", ".zip.sha256"):
+            (self.built / f"ck-entorhinal-windows-arm64{suffix}").rename(self.built / f"ck-entorhinal-darwin-x64{suffix}")
         with patch.dict(os.environ, {"ENTORHINAL_REQUIRES_CORE": "1.2.3"}):
-            with self.assertRaisesRegex(ValueError, "ck-entorhinal-windows-x64.zip.sha256: checksum does not match"):
-                self.assemble(self.root / "release", publish_windows=False)
+            with self.assertRaisesRegex(ValueError, "missing .*windows-arm64.*unexpected .*darwin-x64"):
+                self.assemble(self.root / "release")
+
+    def test_assembly_refuses_corrupt_windows_archives(self):
+        for arch in ("x64", "arm64"):
+            with self.subTest(arch=arch), patch.dict(os.environ, {"ENTORHINAL_REQUIRES_CORE": "1.2.3"}):
+                self.built = self.root / f"built-{arch}"
+                self.make_inventory()
+                archive = self.built / f"ck-entorhinal-windows-{arch}.zip"
+                archive.write_bytes(b"not the archived binary")
+                with self.assertRaisesRegex(ValueError, rf"{archive.name}.sha256: checksum does not match"):
+                    self.assemble(self.root / f"release-{arch}")

@@ -17,8 +17,6 @@ concurrency:
 env:
   # Set to the oldest public core that accepts Entorhinal's registration.
   ENTORHINAL_REQUIRES_CORE: ''
-  # Push CI runs the native Windows suite in three shards; require all three.
-  ENTORHINAL_PUBLISH_WINDOWS: 'true'
 
 jobs:
   verify:
@@ -99,21 +97,21 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: verify
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ (matrix.target == 'linux-arm64' || matrix.target == 'windows-arm64') && 60 || 45 }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: darwin-arm64
             runner: macos-latest
-          - target: darwin-x64
-            runner: macos-15-intel
           - target: linux-x64
             runner: ubuntu-latest
           - target: linux-arm64
             runner: ubuntu-24.04-arm
           - target: windows-x64
             runner: windows-latest
+          - target: windows-arm64
+            runner: windows-11-arm
     env:
       RELEASE_TARGET: ${{ matrix.target }}
       RELEASE_REVISION: ${{ needs.verify.outputs.revision }}
@@ -128,17 +126,45 @@ jobs:
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Require the native runner and Rust toolchain
+        run: |
+          host=$(rustc --print host-tuple)
+          case "$RELEASE_TARGET:$RUNNER_ARCH:$host" in
+            darwin-arm64:ARM64:aarch64-apple-darwin|linux-x64:X64:x86_64-unknown-linux-gnu|linux-arm64:ARM64:aarch64-unknown-linux-gnu) ;;
+            windows-x64:X64:x86_64-pc-windows-msvc|windows-arm64:ARM64:aarch64-pc-windows-msvc) ;;
+            *) echo "::error::$RELEASE_TARGET requires a native runner and Rust toolchain; found $RUNNER_ARCH / $host"; exit 1 ;;
+          esac
+
+      - name: Require PowerShell 7.3+ on PATH
+        if: matrix.target == 'windows-arm64'
+        shell: pwsh
+        run: |
+          if ($PSVersionTable.PSVersion -lt [version]"7.3") {
+            throw "missing pwsh 7.3+ on PATH"
+          }
+          $PSVersionTable.PSVersion.ToString()
+
+      # Match Windows push CI so Defender does not scan every test binary
+      # and temporary SQLite file the suite creates on this disposable runner.
+      - name: Exclude the build and temp folders from Defender
+        if: matrix.target == 'windows-arm64'
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE, $env:TEMP, $env:RUNNER_TEMP, "$env:USERPROFILE\.cargo"
+          Set-MpPreference -DisableRealtimeMonitoring $true
+
+      # Push CI does not cover these two native targets.
+      - name: Test natively on ARM64
+        if: matrix.target == 'linux-arm64' || matrix.target == 'windows-arm64'
+        run: cargo test --workspace --locked
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Build and check ck-entorhinal
-        run: |
-          case "${RELEASE_TARGET##*-}:$RUNNER_ARCH" in
-            arm64:ARM64|x64:X64) ;;
-            *) echo "::error::$RELEASE_TARGET cannot be built natively on $RUNNER_ARCH"; exit 1 ;;
-          esac
-          bash script/release-build.sh
+        run: bash script/release-build.sh
 
       - name: Import Developer ID certificate
         if: runner.os == 'macOS'
@@ -222,9 +248,6 @@ jobs:
           flags=()
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             flags+=(--dry-run)
-          fi
-          if [[ "$ENTORHINAL_PUBLISH_WINDOWS" == true ]]; then
-            flags+=(--publish-windows)
           fi
           python3 script/release/assets.py assemble built-assets release-assets "$RELEASE_VERSION" "${flags[@]}"
 

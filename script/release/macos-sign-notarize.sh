@@ -8,8 +8,8 @@ source_dir="${1:?usage: $0 <source-dir> <asset-dir> <darwin-target>}"
 asset_dir="${2:?asset directory is required}"
 target="${3:?darwin target is required}"
 case "$target" in
-    darwin-arm64|darwin-x64) ;;
-    *) echo "not a darwin target: $target" >&2; exit 1 ;;
+    darwin-arm64) ;;
+    *) echo "unsupported macOS release target: $target" >&2; exit 1 ;;
 esac
 
 : "${APP_STORE_CONNECT_API_KEY_PATH:?App Store Connect API key path is required}"
