@@ -40,6 +40,9 @@ jobs:
       - name: Check hand-written source file sizes
         run: scripts/check-file-sizes.sh
 
+      - name: Check offline release assets
+        run: python3 -m unittest script.tests.release_assets -v
+
       - name: Format check
         run: cargo fmt --all -- --check
 
