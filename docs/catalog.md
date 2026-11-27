@@ -696,8 +696,8 @@ existing bytes.
 ### Integration decisions
 
 `catalog.status_watch {token?}` is open to every principal and uses the same held
-watch transport, shared 16-watch cap, cancellation and drain lifecycle as the
-identity watches. Notices are either `{kind:"resync", token}` or
+watch transport, watch caps (16 per caller route, 64 per machine), cancellation
+and drain lifecycle as the identity watches. Notices are either `{kind:"resync", token}` or
 `{kind:"changes", token, generation, changes:[{name, version}]}`. Tokens combine
 the process incarnation and a local status generation; malformed, foreign,
 future or expired tokens resync. A notice exceeding 192 KiB becomes a resync.
