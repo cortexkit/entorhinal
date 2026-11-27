@@ -599,9 +599,14 @@ async fn folder_presence_batch_names_all_blocked_folders_without_prompting() {
         panic!("expected a refusal")
     };
     assert_eq!(code, "root_not_bound");
-    assert!(message.contains(&format!("{b:?} is unbound")), "{message}");
+    // Refusals quote folders as typed, not Debug-escaped, so Windows
+    // backslashes appear once.
     assert!(
-        message.contains(&format!("{c:?} is unverifiable")),
+        message.contains(&format!("\"{b}\" is unbound")),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("\"{c}\" is unverifiable")),
         "{message}"
     );
     assert_eq!(f.count(), 0);

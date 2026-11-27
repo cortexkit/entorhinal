@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use entorhinal_core::folder_approval::quote_folder;
 use serde_json::{json, Value};
 
 #[path = "catalog_cli.rs"]
@@ -1412,30 +1413,34 @@ async fn execute_approve_projects(
                 "invalid_params: approve at most 100 projects at once".into(),
             ));
         }
-        let name = project_name.as_deref().unwrap_or(&project_id);
+        // Show folders and names as typed, so Windows backslashes appear once,
+        // matching the presence prompt and the module's refusals.
+        let name = quote_folder(project_name.as_deref().unwrap_or(&project_id));
         let mut all_approved = true;
         for folder in root_records {
             let root = folder.root;
+            let shown = quote_folder(&root);
             if folder.identity != "bound" {
                 all_approved = false;
                 let fix = if matches!(folder.identity.as_str(), "unbound" | "replaced") {
-                    format!("run ck projects rebind {root:?}")
+                    format!("run ck projects rebind {shown}")
                 } else {
                     "restore the checkout and its Git metadata, then try again".to_owned()
                 };
                 refused.push(format!(
-                    "refused {root:?} (project {name:?}): checkout is {}; {fix}",
+                    "refused {shown} (project {name}): checkout is {}; {fix}",
                     folder.identity
                 ));
             } else if folder.approval.state != "approved" {
                 all_approved = false;
-                ready.push(format!("to be approved {root:?} (project {name:?})"));
+                ready.push(format!("to be approved {shown} (project {name})"));
                 expected.push(json!({"projectId":project_id,"root":root}));
             }
         }
         if all_approved {
             already.push(format!(
-                "already approved project {name:?} ({project_id:?})"
+                "already approved project {name} ({})",
+                quote_folder(&project_id)
             ));
         }
     }
@@ -3850,7 +3855,7 @@ mod agent_tests {
             )
         );
         assert_eq!(String::from_utf8(terminal.output).unwrap(), format!(
-            "to be approved {a:?} (project \"Project A\")\nalready approved project \"Project B\" (\"B\")\n{AGENT_WRITE_NOTICE}\n"
+            "to be approved \"{a}\" (project \"Project A\")\nalready approved project \"Project B\" (\"B\")\n{AGENT_WRITE_NOTICE}\n"
         ));
     }
 
