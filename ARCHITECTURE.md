@@ -76,7 +76,7 @@ Package files live outside SQLite, in a content-addressed folder beside the stor
 | Operation | Admitted from |
 |---|---|
 | Identity, project, session, location and context reads | any principal |
-| `register`, `attach_root`, `add_root`, `approve_root`, `approve_project` | `Direct` after an operator presence prompt |
+| `register`, `attach_root`, `add_root`, `approve_root`, `approve_project`, `approve_projects` | `Direct` after an operator presence prompt |
 | `set_workspace_root`, `approve_workspace_root` | `Direct` after an operator presence prompt; clearing a workspace root does not prompt |
 | `unapprove_root`, `unapprove_project`, `unapprove_workspace_root` | `Direct`, without a prompt |
 | Other project and workspace writes, including `attach_derived_parent` | Generally `Direct` (the `ck` commands) or `reserved:prefrontal`; see [the module surface](docs/module-surface.md#projects) for exceptions |

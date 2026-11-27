@@ -155,7 +155,8 @@ Tests: `writes_are_refused_unless_the_operator_or_the_executive_opened_the_route
 
 Most project mutations are admitted from Direct or the executive; anyone else
 gets `write_not_permitted`. `register`, `attach_root`, `add_root`, `approve_root`,
-`approve_project`, `unapprove_root`, `unapprove_project`, `set_workspace_root`,
+`approve_project`, `approve_projects`, `unapprove_root`, `unapprove_project`,
+`set_workspace_root`,
 `approve_workspace_root`, and `unapprove_workspace_root` are Direct-only, and
 refuse the executive with `write_not_permitted`.
 `attach_derived_parent` remains admitted from the executive without a prompt.
@@ -175,6 +176,19 @@ machines. The replies
 include `folderApprovals` with `{root, state}` for each root and a `reason` for
 each folder left unapproved because it could not be bound. Unapproving and
 clearing a workspace root do not prompt.
+
+`approve_projects` takes `{canonicalRoots, expected: [{projectId, root}], requestKey?, actor?}`
+and resolves those paths to distinct projects. `expected` is the exact set of
+folders shown in the client's preview as awaiting approval. If it differs from
+the server's set, the batch refuses `operator_approval_stale` before prompting.
+It also refuses before prompting if any root to be approved is unbound or
+unverifiable, naming all such folders. It prompts
+only if there are roots to approve. The reply is
+`{approved: [{projectId, name, roots}], alreadyApproved: [{projectId, name}], generation}`.
+`roots` lists only the folders newly approved on this machine. If any checked
+project or folder changes while the prompt is open, the entire batch refuses
+`operator_approval_stale`. Retrying a batch that wrote approvals with the same
+`requestKey` returns the original reply without prompting again.
 
 Setting or approving a workspace root prompts once, naming the workspace and
 folder. Unlike a project checkout, a workspace root is approved for its current
@@ -212,6 +226,7 @@ root mutations return the resulting `approval` when a root remains set.
 | `attach_derived_parent` | mutate | Attach a worker container to a root's current approved binding. |
 | `approve_root`, `unapprove_root` | mutate | Approve or withdraw approval of one root's current binding. |
 | `approve_project`, `unapprove_project` | mutate | The same for every root of the project a path belongs to; approval refuses unless every root is identified. |
+| `approve_projects` | mutate | Approve the remaining roots of up to 100 distinct projects together, locally, with one presence prompt and one transaction. |
 | `seed_import` | mutate | Bulk-import registrations from a seed file (recovery). |
 | `rebuild` | mutate | Rebuild the derived tables by replaying the journal (recovery). |
 

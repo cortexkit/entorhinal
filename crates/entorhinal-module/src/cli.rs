@@ -412,7 +412,8 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
                           own no remote
   owned-remotes <root> --default
                           reset ownership to origin
-  approve <dir>           approve all of the project's roots after confirmation
+  approve <dir> [<dir>...]
+                          approve the named projects' roots with one confirmation
   unapprove <dir>         withdraw that approval
   trust <dir>             show each root's identity and approval
   verify                  check the store against its journal
@@ -571,6 +572,7 @@ fn run_command(
             if !command.json
                 && command.face == Face::Projects
                 && matches!(command.verb.as_str(), "attach" | "approve" | "unapprove")
+                && method != "approve_projects"
             {
                 if let Ok(projects) = call(
                     command.connection.as_deref(),
@@ -891,6 +893,10 @@ fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
                 json!({"root":query(root)?,"name":name,"actor":actor}),
             )
         }
+        (Face::Projects, "approve") if command.args.len() > 1 => (
+            "approve_projects".to_string(),
+            json!({"canonicalRoots":command.args.iter().map(|dir| query(dir)).collect::<Result<Vec<_>, _>>()?, "actor":actor}),
+        ),
         (Face::Projects, "approve") => (
             "approve_project".to_string(),
             json!({ "canonicalRoot": query(&need(0, "a directory")?)?, "actor": actor }),
@@ -1338,6 +1344,136 @@ async fn agent_read(
     Ok(value)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApprovalPreview {
+    via: String,
+    project_id: String,
+    project_name: Option<String>,
+    #[serde(default)]
+    root_records: Vec<ApprovalPreviewRoot>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApprovalPreviewRoot {
+    root: String,
+    identity: String,
+    approval: ApprovalPreviewState,
+}
+
+#[derive(serde::Deserialize)]
+struct ApprovalPreviewState {
+    state: String,
+}
+
+async fn execute_approve_projects(
+    caller: &impl CliCaller,
+    mut params: Value,
+    stderr: &mut impl std::io::Write,
+) -> Result<Value, (u8, String)> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut ready = Vec::new();
+    let mut already = Vec::new();
+    let mut refused = Vec::new();
+    let mut expected = Vec::new();
+    for path in params["canonicalRoots"]
+        .as_array()
+        .expect("batch CLI builds paths")
+    {
+        let reply = caller
+            .call(
+                "trust",
+                json!({"canonicalRoot":path}),
+                placement_call_options("trust"),
+            )
+            .await
+            .map_err(CallFailure::display)?;
+        let preview: ApprovalPreview = serde_json::from_value(reply)
+            .map_err(|error| (EXIT_TRANSPORT, format!("decode approval preview: {error}")))?;
+        if !matches!(preview.via.as_str(), "root" | "walk") || preview.root_records.is_empty() {
+            refused.push(format!(
+                "refused {}: not inside a registered root; register or name a registered checkout",
+                text(path)
+            ));
+            continue;
+        }
+        let ApprovalPreview {
+            project_id,
+            project_name,
+            root_records,
+            ..
+        } = preview;
+        if !seen.insert(project_id.clone()) {
+            continue;
+        }
+        if seen.len() > 100 {
+            return Err((
+                EXIT_REFUSED,
+                "invalid_params: approve at most 100 projects at once".into(),
+            ));
+        }
+        let name = project_name.as_deref().unwrap_or(&project_id);
+        let mut all_approved = true;
+        for folder in root_records {
+            let root = folder.root;
+            if folder.identity != "bound" {
+                all_approved = false;
+                let fix = if matches!(folder.identity.as_str(), "unbound" | "replaced") {
+                    format!("run ck projects rebind {root:?}")
+                } else {
+                    "restore the checkout and its Git metadata, then try again".to_owned()
+                };
+                refused.push(format!(
+                    "refused {root:?} (project {name:?}): checkout is {}; {fix}",
+                    folder.identity
+                ));
+            } else if folder.approval.state != "approved" {
+                all_approved = false;
+                ready.push(format!("to be approved {root:?} (project {name:?})"));
+                expected.push(json!({"projectId":project_id,"root":root}));
+            }
+        }
+        if all_approved {
+            already.push(format!(
+                "already approved project {name:?} ({project_id:?})"
+            ));
+        }
+    }
+    let notice = if !refused.is_empty() {
+        "Batch refused; no folders will be approved."
+    } else if ready.is_empty() {
+        "No confirmation is needed; all named projects are already approved."
+    } else {
+        AGENT_WRITE_NOTICE
+    };
+    // Keep stdout available for the final reply, especially with --json.
+    for line in ready
+        .iter()
+        .chain(&already)
+        .chain(&refused)
+        .map(String::as_str)
+        .chain([notice])
+    {
+        writeln!(stderr, "{line}")
+            .map_err(|error| (EXIT_TRANSPORT, format!("print approval preview: {error}")))?;
+    }
+    stderr
+        .flush()
+        .map_err(|error| (EXIT_TRANSPORT, format!("flush approval preview: {error}")))?;
+    if !refused.is_empty() {
+        return Err((EXIT_REFUSED, "no approval request sent".into()));
+    }
+    params["expected"] = json!(expected);
+    caller
+        .call(
+            "approve_projects",
+            params,
+            placement_call_options("approve_projects"),
+        )
+        .await
+        .map_err(CallFailure::display)
+}
+
 async fn execute_move_root(
     caller: &impl CliCaller,
     mut params: Value,
@@ -1663,6 +1799,15 @@ fn call(
                 params,
             )
             .await
+        } else if method == "approve_projects" {
+            execute_approve_projects(
+                &ConsumerCaller {
+                    consumer: &consumer,
+                },
+                params,
+                &mut std::io::stderr(),
+            )
+            .await
         } else if method == "move_root_to_new_project" {
             execute_move_root(
                 &ConsumerCaller {
@@ -1943,6 +2088,11 @@ fn render(command: &Command, value: &Value) {
                     text(&record["identity"]),
                     text(&record["root"])
                 );
+            }
+        }
+        (Face::Projects, "approve") if command.args.len() > 1 => {
+            for line in format_batch_approval(value) {
+                println!("{line}");
             }
         }
         (Face::Projects, "approve" | "unapprove") => {
@@ -2295,6 +2445,28 @@ fn format_project_approval(
             )
         })
         .collect()
+}
+
+fn format_batch_approval(value: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for project in value["approved"].as_array().into_iter().flatten() {
+        for root in project["roots"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "approved {} (project {}, {})",
+                text(root),
+                text(&project["name"]),
+                text(&project["projectId"])
+            ));
+        }
+    }
+    for project in value["alreadyApproved"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "already approved project {} ({})",
+            text(&project["name"]),
+            text(&project["projectId"])
+        ));
+    }
+    lines
 }
 
 fn project_name_from_list(projects: &Value, project_id: &Value) -> Option<String> {
@@ -2988,6 +3160,23 @@ mod tests {
     }
 
     #[test]
+    fn project_approval_single_dir_keeps_existing_rpc() {
+        let cwd = crate::tests::canonical_test_path(std::env::current_dir().unwrap());
+        let root = cwd.to_str().unwrap();
+        let Invocation::Command(command) = parse(Face::Projects, &["approve".into(), root.into()])
+        else {
+            panic!("approve must parse")
+        };
+        assert_eq!(
+            build_at(&command, root).unwrap(),
+            (
+                "approve_project".into(),
+                json!({"canonicalRoot":root,"actor":"ck-projects"}),
+            )
+        );
+    }
+
+    #[test]
     fn attach_cli_refuses_malformed_flags_and_maps_log_commands() {
         for args in [
             vec!["attach", "--project"],
@@ -3587,6 +3776,102 @@ mod agent_tests {
         }
     }
 
+    fn batch_preview(id: &str, root: &str, identity: &str, state: &str) -> Value {
+        json!({"projectId":id,"projectName":format!("Project {id}"),"via":"root",
+            "rootRecords":[{"root":root,"identity":identity,"approval":{"state":state}}]})
+    }
+
+    #[tokio::test]
+    async fn project_approval_batch_cli_flushes_preview_before_sending_write() {
+        struct Terminal<'a> {
+            script: &'a Script,
+            output: Vec<u8>,
+        }
+        impl std::io::Write for Terminal<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.output.write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                assert_eq!(
+                    self.script
+                        .calls()
+                        .iter()
+                        .map(|call| call.0.as_str())
+                        .collect::<Vec<_>>(),
+                    ["trust", "trust"]
+                );
+                Ok(())
+            }
+        }
+        let cwd = crate::tests::canonical_test_path(std::env::current_dir().unwrap());
+        let a = cwd.join("preview-a").to_string_lossy().into_owned();
+        let b = cwd.join("preview-b").to_string_lossy().into_owned();
+        let Invocation::Command(command) = parse(
+            Face::Projects,
+            &[
+                "approve".into(),
+                "preview-a".into(),
+                "preview-b".into(),
+                "--json".into(),
+            ],
+        ) else {
+            panic!("batch approve must parse")
+        };
+        assert!(command.json);
+        let (method, params) = build_at(&command, cwd.to_str().unwrap()).unwrap();
+        assert_eq!(method, "approve_projects");
+        let final_reply = json!({"approved":[{"projectId":"A","name":"Project A","roots":[a]}],
+                                 "alreadyApproved":[{"projectId":"B","name":"Project B"}], "generation":9});
+        let script = Script::new(vec![
+            Ok(batch_preview("A", &a, "bound", "unapproved")),
+            Ok(batch_preview("B", &b, "bound", "approved")),
+            Ok(final_reply.clone()),
+        ]);
+        let mut terminal = Terminal {
+            script: &script,
+            output: Vec::new(),
+        };
+        assert_eq!(
+            execute_approve_projects(&script, params, &mut terminal)
+                .await
+                .unwrap(),
+            final_reply
+        );
+        let calls = script.calls();
+        assert_eq!(calls[0].1, json!({"canonicalRoot":a}));
+        assert_eq!(calls[1].1, json!({"canonicalRoot":b}));
+        assert_eq!(
+            calls[2],
+            (
+                "approve_projects".into(),
+                json!({"canonicalRoots":[a,b],"actor":"ck-projects",
+            "expected":[{"projectId":"A","root":a}]}),
+                Duration::from_secs(300)
+            )
+        );
+        assert_eq!(String::from_utf8(terminal.output).unwrap(), format!(
+            "to be approved {a:?} (project \"Project A\")\nalready approved project \"Project B\" (\"B\")\n{AGENT_WRITE_NOTICE}\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_approval_batch_cli_refusal_names_fix_and_never_sends_write() {
+        let script = Script::new(vec![
+            Ok(batch_preview("A", "/a", "bound", "unapproved")),
+            Ok(batch_preview("B", "/b", "unbound", "unapproved")),
+        ]);
+        let mut preview = Vec::new();
+        let error =
+            execute_approve_projects(&script, json!({"canonicalRoots":["/a","/b"]}), &mut preview)
+                .await
+                .unwrap_err();
+        assert_eq!(error.0, EXIT_REFUSED);
+        assert_eq!(script.calls().len(), 2);
+        let preview = String::from_utf8(preview).unwrap();
+        assert!(preview.contains("refused \"/b\" (project \"Project B\"): checkout is unbound; run ck projects rebind \"/b\""));
+        assert!(!preview.contains(AGENT_WRITE_NOTICE));
+    }
+
     #[tokio::test]
     async fn move_root_cli_resolves_source_and_reports_key_and_required_setup() {
         let script = Script::new(vec![
@@ -3765,6 +4050,7 @@ mod agent_tests {
             "attach_root",
             "add_root",
             "approve_project",
+            "approve_projects",
         ] {
             assert_eq!(
                 placement_call_options(method).timeout,

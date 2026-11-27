@@ -1494,6 +1494,12 @@ impl Write {
                 FolderWrite::Register(serde_json::from_value(params).map_err(invalid_params)?),
                 None,
             ),
+            "approve_projects" => Self::Folder(
+                FolderWrite::ApproveProjects(
+                    serde_json::from_value(params).map_err(invalid_params)?,
+                ),
+                None,
+            ),
             "approve_root" | "approve_project" => {
                 let project = method == "approve_project";
                 let (path, actor) = if project {
@@ -2157,7 +2163,9 @@ impl ProjectsHandler {
                         return Ok(match write.precheck(store, clock())? {
                             FolderPrecheck::Cached(body) => (AgentPrecheck::Cached(body), None),
                             FolderPrecheck::Ready(plan) => (
-                                AgentPrecheck::Ready(plan.summary().to_owned()),
+                                plan.summary().map_or(AgentPrecheck::NoPrompt, |summary| {
+                                    AgentPrecheck::Ready(summary.to_owned())
+                                }),
                                 Some(Write::Folder(write.clone(), Some(plan))),
                             ),
                         });
@@ -2203,6 +2211,7 @@ impl ProjectsHandler {
                 // A confirmable method whose precheck found nothing needing approval.
                 AgentPrecheck::NoPrompt => None,
             };
+            prepared = confirmed_write.or(prepared);
             if let Some(summary) = summary {
                 #[cfg(test)]
                 if let Some(barrier) = &self.confirmation_admission_barrier {
@@ -2228,7 +2237,6 @@ impl ProjectsHandler {
                 }
                 budget_start = Instant::now();
                 approval = Some(OperatorApproval::new(summary));
-                prepared = confirmed_write.or(prepared);
                 confirmation = Some(guard);
             }
         } else if state == "enabled" {
@@ -2410,7 +2418,7 @@ impl ProjectsHandler {
             self.commits.notify_waiters();
             return self.record_mutation(Ok(body));
         }
-        if approval.is_some() || creating {
+        if approval.is_some() || creating || matches!(&prepared, Some(Write::Folder(_, Some(_)))) {
             let before = store.generation().map_err(storage_error)?;
             let body = prepared.unwrap().run(
                 &store,

@@ -1371,6 +1371,7 @@ pub(crate) mod tests {
                         *method,
                         "approve_root"
                             | "approve_project"
+                            | "approve_projects"
                             | "register"
                             | "attach_root"
                             | "add_root"

@@ -1,6 +1,7 @@
 //! Operator-confirmed project folder writes and checkout proofs.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction};
@@ -8,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::binding::{self, BindingRow, DiskIdentity, PreparedBinding};
-use crate::mutations::{canonical, wire_value, Action};
+use crate::mutations::{append, canonical, wire_value, Action};
 use crate::{
     domain, AddRootRequest, AttachRootRequest, JournalWriter, RegisterRequest, RegistryError,
     RegistryStore,
@@ -24,6 +25,25 @@ pub enum FolderWrite {
         actor: String,
         project: bool,
     },
+    ApproveProjects(ApproveProjectsRequest),
+}
+
+pub(crate) const APPROVE_PROJECTS: &str = "approve_projects";
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApproveProjectsRequest {
+    canonical_roots: Vec<String>,
+    expected: BTreeSet<ProjectFolder>,
+    request_key: Option<String>,
+    actor: Option<String>,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+struct ProjectFolder {
+    project_id: String,
+    root: String,
 }
 
 pub enum FolderPrecheck {
@@ -33,7 +53,18 @@ pub enum FolderPrecheck {
 
 #[derive(Clone)]
 pub struct FolderPlan {
-    summary: String,
+    summary: Option<String>,
+    checked: CheckedFolders,
+}
+
+#[derive(Clone)]
+enum CheckedFolders {
+    Single(SinglePlan),
+    Batch(Vec<ProjectSnapshot>),
+}
+
+#[derive(Clone)]
+struct SinglePlan {
     target: Target,
     project_before: Option<Value>,
     roots: Vec<RootSnapshot>,
@@ -42,8 +73,8 @@ pub struct FolderPlan {
 }
 
 impl FolderPlan {
-    pub fn summary(&self) -> &str {
-        &self.summary
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
     }
 }
 
@@ -171,6 +202,92 @@ struct Target {
     parents: Vec<String>,
 }
 
+impl Target {
+    fn read(
+        conn: &Connection,
+        project: String,
+        roots: Vec<String>,
+        parents: Vec<String>,
+    ) -> Result<Self, RegistryError> {
+        let name = conn.query_row(
+            "SELECT name FROM project WHERE project_id=?1",
+            [&project],
+            |row| row.get(0),
+        )?;
+        let keys = roots
+            .iter()
+            .map(|root| crate::root_keys::mapped_key(conn, root))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            project,
+            name,
+            roots,
+            keys,
+            parents,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct ProjectSnapshot {
+    target: Target,
+    before: Option<Value>,
+    roots: Vec<RootSnapshot>,
+}
+
+fn approval_project(
+    store: &RegistryStore,
+    conn: &Connection,
+    path: &str,
+) -> Result<(String, Vec<String>), RegistryError> {
+    let (path_input, checkouts) = crate::ResolvePath::read(path, None, false)?;
+    let reply = store.resolve_walk_in(conn, &path_input, None, &checkouts)?;
+    if !matches!(reply.via.as_str(), "root" | "walk") {
+        return Err(domain(
+            "not_found",
+            format!("{path} is not inside a registered root"),
+        ));
+    }
+    Ok((
+        reply.project_id,
+        reply
+            .root_fields
+            .expect("walk includes root fields")
+            .root_records
+            .into_iter()
+            .map(|r| r.root)
+            .collect(),
+    ))
+}
+
+fn read_roots(conn: &Connection, paths: &[String]) -> Result<Vec<RootSnapshot>, RegistryError> {
+    paths
+        .iter()
+        .map(|root| RootSnapshot::read(conn, root))
+        .collect()
+}
+
+fn revalidate_roots(
+    conn: &Connection,
+    paths: &[String],
+    target: &Target,
+    before: &Option<Value>,
+    roots: &[RootSnapshot],
+) -> Result<Vec<RootSnapshot>, RegistryError> {
+    if paths != target.roots || project_state(conn, &target.project)? != *before {
+        return Err(stale());
+    }
+    let current = read_roots(conn, paths)?;
+    if !roots
+        .iter()
+        .zip(&current)
+        .all(|(old, new)| old.matches(new))
+    {
+        return Err(stale());
+    }
+    Ok(current)
+}
+
 fn project_state(conn: &Connection, project: &str) -> Result<Option<Value>, RegistryError> {
     Ok(conn.query_row(
         "SELECT name,domain,workspace_id,created_at FROM project LEFT JOIN project_workspace USING(project_id) WHERE project_id=?1",
@@ -254,6 +371,7 @@ impl FolderWrite {
             Self::Add(_) => "add_root",
             Self::Approve { project: true, .. } => "approve_project",
             Self::Approve { project: false, .. } => "approve_root",
+            Self::ApproveProjects(_) => APPROVE_PROJECTS,
         }
     }
 
@@ -261,6 +379,7 @@ impl FolderWrite {
         match self {
             Self::Register(req) => req.request_key.as_deref(),
             Self::Attach(req) => req.request_key.as_deref(),
+            Self::ApproveProjects(req) => req.request_key.as_deref(),
             _ => None,
         }
     }
@@ -270,7 +389,7 @@ impl FolderWrite {
             Self::Register(req) => req.label.as_deref(),
             Self::Attach(req) => req.label.as_deref(),
             Self::Add(req) => req.label.as_deref(),
-            Self::Approve { .. } => None,
+            Self::Approve { .. } | Self::ApproveProjects(_) => None,
         }
     }
 
@@ -280,6 +399,7 @@ impl FolderWrite {
             Self::Attach(req) => req.actor.as_deref(),
             Self::Add(req) => req.actor.as_deref(),
             Self::Approve { actor, .. } => Some(actor.as_str()),
+            Self::ApproveProjects(req) => Some(req.actor.as_deref().unwrap_or("operator")),
         }
         .unwrap_or("module")
     }
@@ -289,7 +409,7 @@ impl FolderWrite {
             Self::Register(req) => req.normalize()?,
             Self::Add(req) => req.root = canonical(&req.root)?,
             // attach_match retains its disabled-log refusal before path checks.
-            Self::Attach(_) | Self::Approve { .. } => {}
+            Self::Attach(_) | Self::Approve { .. } | Self::ApproveProjects(_) => {}
         }
         Ok(())
     }
@@ -312,23 +432,8 @@ impl FolderWrite {
                 project: true,
                 path,
                 ..
-            } => {
-                let (path_input, checkouts) = crate::ResolvePath::read(path, None, false)?;
-                let reply = store.resolve_walk_in(conn, &path_input, None, &checkouts)?;
-                if !matches!(reply.via.as_str(), "root" | "walk") {
-                    return Err(domain(
-                        "not_found",
-                        format!("{path} is not inside a registered root"),
-                    ));
-                }
-                Ok(reply
-                    .root_fields
-                    .expect("walk includes root fields")
-                    .root_records
-                    .into_iter()
-                    .map(|r| r.root)
-                    .collect())
-            }
+            } => Ok(approval_project(store, conn, path)?.1),
+            Self::ApproveProjects(_) => unreachable!("batch resolves one target per project"),
         }
     }
 
@@ -356,14 +461,7 @@ impl FolderWrite {
                 let mut results = Vec::new();
                 let mut last = None;
                 for (root, bound) in roots.iter().zip(&bindings) {
-                    let written = binding::approve_in(
-                        tx,
-                        &root.root,
-                        &bound.epoch,
-                        self.actor(),
-                        writer.principal,
-                        now,
-                    )?;
+                    let written = self.approve_bound_root(writer, tx, root, bound, now)?;
                     results.push(json!({"root":root.root,"registrationEpoch":bound.epoch,"noop":written.is_none()}));
                     if written.is_some() {
                         last = written;
@@ -384,7 +482,26 @@ impl FolderWrite {
                     payload,
                 })
             }
+            Self::ApproveProjects(_) => unreachable!("batch uses commit_batch"),
         }
+    }
+
+    fn approve_bound_root(
+        &self,
+        writer: &JournalWriter<'_>,
+        tx: &Transaction<'_>,
+        root: &RootSnapshot,
+        bound: &BindingRow,
+        now: i64,
+    ) -> Result<Option<(i64, Value)>, RegistryError> {
+        binding::approve_in(
+            tx,
+            &root.root,
+            &bound.epoch,
+            self.actor(),
+            writer.principal,
+            now,
+        )
     }
 
     fn target(
@@ -403,26 +520,11 @@ impl FolderWrite {
                 .expect("project write returns projectId")
                 .into()
         };
-        let name = conn.query_row(
-            "SELECT name FROM project WHERE project_id=?1",
-            [&project],
-            |row| row.get(0),
-        )?;
-        let keys = roots
-            .iter()
-            .map(|root| crate::root_keys::mapped_key(conn, root))
-            .collect::<Result<_, _>>()?;
         let parents = match self {
             Self::Register(req) => req.derived_root_parents.clone(),
             _ => Vec::new(),
         };
-        Ok(Target {
-            project,
-            name,
-            roots,
-            keys,
-            parents,
-        })
+        Target::read(conn, project, roots, parents)
     }
 
     pub fn precheck(
@@ -433,15 +535,15 @@ impl FolderWrite {
         if let Some(body) = store.shared_request_cache(self.op(), self.request_key())? {
             return Ok(FolderPrecheck::Cached(body));
         }
+        if let Self::ApproveProjects(req) = self {
+            return req.precheck(store);
+        }
         let mut request = self.clone();
         request.normalize()?;
         let mut copy = store.read(crate::read_connection::copy_snapshot)?;
         let tx = copy.transaction()?;
         let paths = request.roots(store, &tx)?;
-        let roots = paths
-            .iter()
-            .map(|root| RootSnapshot::read(&tx, root))
-            .collect::<Result<Vec<_>, _>>()?;
+        let roots = read_roots(&tx, &paths)?;
         let placement = RefCell::new(None);
         let mut writer = store.with_principal("direct");
         writer.probe = Some(&placement);
@@ -464,6 +566,7 @@ impl FolderWrite {
             (Self::Attach(_), true) => "Attach and approve for",
             (Self::Attach(_), false) => "Attach to",
             (Self::Approve { .. }, _) => "Approve for",
+            (Self::ApproveProjects(_), _) => unreachable!("batch has its own summary"),
         };
         let mut summary = format!("{action} project {:?}", target.name);
         if !target.roots.is_empty() {
@@ -483,12 +586,14 @@ impl FolderWrite {
             ));
         }
         Ok(FolderPrecheck::Ready(Box::new(FolderPlan {
-            summary,
-            target,
-            project_before,
-            roots,
-            parent_files,
-            placement,
+            summary: Some(summary),
+            checked: CheckedFolders::Single(SinglePlan {
+                target,
+                project_before,
+                roots,
+                parent_files,
+                placement,
+            }),
         })))
     }
 
@@ -498,28 +603,21 @@ impl FolderWrite {
         plan: &FolderPlan,
         now: i64,
     ) -> Result<Vec<u8>, RegistryError> {
+        let plan = match (&plan.checked, self) {
+            (CheckedFolders::Batch(projects), Self::ApproveProjects(req)) => {
+                return self.commit_batch(writer, req, projects, now);
+            }
+            (CheckedFolders::Single(_), Self::ApproveProjects(_)) => return Err(stale()),
+            (CheckedFolders::Single(plan), _) => plan,
+            _ => return Err(stale()),
+        };
         let mut request = self.clone();
         request.normalize().map_err(stale_on_domain)?;
         let op = request.op();
         let body = writer.mutation(op, request.request_key(), |tx| {
             let paths = request.roots(writer, tx).map_err(stale_on_domain)?;
-            if paths != plan.target.roots
-                || project_state(tx, &plan.target.project)? != plan.project_before
-            {
-                return Err(stale());
-            }
-            let roots = paths
-                .iter()
-                .map(|root| RootSnapshot::read(tx, root))
-                .collect::<Result<Vec<_>, _>>()?;
-            if !plan
-                .roots
-                .iter()
-                .zip(&roots)
-                .all(|(old, current)| old.matches(current))
-            {
-                return Err(stale());
-            }
+            let roots =
+                revalidate_roots(tx, &paths, &plan.target, &plan.project_before, &plan.roots)?;
             let placement = RefCell::new(None);
             let mut check = writer.store.with_principal(writer.principal);
             check.probe = Some(&placement);
@@ -557,6 +655,173 @@ impl FolderWrite {
             );
         }
         Ok(body)
+    }
+
+    fn commit_batch(
+        &self,
+        writer: &JournalWriter<'_>,
+        req: &ApproveProjectsRequest,
+        checked: &[ProjectSnapshot],
+        now: i64,
+    ) -> Result<Vec<u8>, RegistryError> {
+        writer.mutation(self.op(), self.request_key(), |tx| {
+            let targets = req.resolve(writer, tx).map_err(stale_on_domain)?;
+            if targets.len() != checked.len() {
+                return Err(stale());
+            }
+            let mut projects = Vec::new();
+            for ((project, paths), old) in targets.into_iter().zip(checked) {
+                let roots = revalidate_roots(tx, &paths, &old.target, &old.before, &old.roots)?;
+                let target = Target::read(tx, project, paths, Vec::new())?;
+                if target != old.target {
+                    return Err(stale());
+                }
+                projects.push(ProjectSnapshot {
+                    target,
+                    before: old.before.clone(),
+                    roots,
+                });
+            }
+            req.check_expected(&projects).map_err(stale_on_domain)?;
+
+            let mut approved = Vec::new();
+            let mut already_approved = Vec::new();
+            for project in projects {
+                let mut written = Vec::new();
+                for root in project.roots.iter().filter(|r| r.approved.is_none()) {
+                    let bound = root.bound(self.op()).map_err(stale_on_domain)?;
+                    self.approve_bound_root(writer, tx, root, bound, now)?;
+                    written.push(&root.root);
+                }
+                let mut entry =
+                    json!({"projectId":project.target.project,"name":project.target.name});
+                if written.is_empty() {
+                    already_approved.push(entry);
+                } else {
+                    entry["roots"] = json!(written);
+                    approved.push(entry);
+                }
+            }
+            let payload = json!({"approved":approved});
+            // The root events carry the approvals for replay. This last event
+            // holds the batch reply and request key without keying any one root.
+            let seq = if approved.is_empty() {
+                None
+            } else {
+                Some(append(
+                    tx,
+                    self.op(),
+                    &payload,
+                    self.actor(),
+                    self.request_key(),
+                    now,
+                    writer.principal,
+                )?)
+            };
+            Ok(Action {
+                changed: seq.is_some(),
+                seq,
+                value: json!({"approved":approved,"alreadyApproved":already_approved}),
+                payload,
+            })
+        })
+    }
+}
+
+impl ApproveProjectsRequest {
+    fn resolve(
+        &self,
+        store: &RegistryStore,
+        conn: &Connection,
+    ) -> Result<Vec<(String, Vec<String>)>, RegistryError> {
+        let mut ids = BTreeSet::new();
+        let mut projects = Vec::new();
+        for path in &self.canonical_roots {
+            let (project, roots) = approval_project(store, conn, path)?;
+            if ids.insert(project.clone()) {
+                if ids.len() > 100 {
+                    return Err(domain(
+                        "invalid_params",
+                        "approve at most 100 projects at once",
+                    ));
+                }
+                projects.push((project, roots));
+            }
+        }
+        Ok(projects)
+    }
+
+    fn check_expected(&self, projects: &[ProjectSnapshot]) -> Result<(), RegistryError> {
+        let mut pending = BTreeSet::new();
+        let mut refused = Vec::new();
+        for project in projects {
+            for root in &project.roots {
+                if let Some(reason) = &root.checkout.reason {
+                    refused.push(format!(
+                        "{} is unverifiable: {reason}",
+                        quote_folder(&root.root)
+                    ));
+                } else if root.bound(APPROVE_PROJECTS).is_err() {
+                    let reason = if root.binding.is_some() {
+                        "replaced"
+                    } else {
+                        "unbound"
+                    };
+                    refused.push(format!("{} is {reason}", quote_folder(&root.root)));
+                } else if root.approved.is_none() {
+                    pending.insert(ProjectFolder {
+                        project_id: project.target.project.clone(),
+                        root: root.root.clone(),
+                    });
+                }
+            }
+        }
+        if !refused.is_empty() {
+            return Err(domain(
+                "root_not_bound",
+                format!("nothing is approved: {}", refused.join("; ")),
+            ));
+        }
+        if pending != self.expected {
+            return Err(domain(
+                "operator_approval_stale",
+                "the project folders awaiting approval changed; preview the batch again",
+            ));
+        }
+        Ok(())
+    }
+
+    fn precheck(&self, store: &RegistryStore) -> Result<FolderPrecheck, RegistryError> {
+        let copy = store.read(crate::read_connection::copy_snapshot)?;
+        let projects = self
+            .resolve(store, &copy)?
+            .into_iter()
+            .map(|(project, paths)| {
+                let before = project_state(&copy, &project)?;
+                let roots = read_roots(&copy, &paths)?;
+                let target = Target::read(&copy, project, paths, Vec::new())?;
+                Ok(ProjectSnapshot {
+                    target,
+                    before,
+                    roots,
+                })
+            })
+            .collect::<Result<Vec<_>, RegistryError>>()?;
+        self.check_expected(&projects)?;
+        let summary = (!self.expected.is_empty()).then(|| {
+            format!(
+                "Approve {} project folders listed in the terminal",
+                self.expected.len()
+            )
+        });
+        // A count is the only variable part of the summary, so it always fits.
+        debug_assert!(summary
+            .as_ref()
+            .is_none_or(|s| s.len() <= crate::agent::OPERATOR_SUMMARY_LIMIT));
+        Ok(FolderPrecheck::Ready(Box::new(FolderPlan {
+            summary,
+            checked: CheckedFolders::Batch(projects),
+        })))
     }
 }
 

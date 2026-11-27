@@ -767,6 +767,7 @@ const MUTATING_METHODS: &[&str] = &[
     "approve_root",
     "unapprove_root",
     "approve_project",
+    "approve_projects",
     "unapprove_project",
     "agent.create",
     "agent.rename",
@@ -824,6 +825,7 @@ const SELF_ADMITTED_METHODS: &[&str] = &[
 const CONFIRMED_FOLDER_WRITES: &[&str] = &[
     "approve_root",
     "approve_project",
+    "approve_projects",
     "register",
     "attach_root",
     "add_root",
@@ -2628,6 +2630,11 @@ fn manifest() -> ModuleManifest {
                     "With operator confirmation, approve every root of a project if all are identified.",
                 ),
                 management_operation(
+                    "approve_projects",
+                    ManagementOperationKind::Mutate,
+                    "With one operator confirmation, approve the remaining roots of up to 100 named projects together.",
+                ),
+                management_operation(
                     "unapprove_project",
                     ManagementOperationKind::Mutate,
                     "Withdraw approval from every root of the project a path belongs to.",
@@ -3622,6 +3629,13 @@ mod tests {
         assert_eq!(
             handler
                 .admit("refresh_root_key", flow_route)
+                .unwrap_err()
+                .code,
+            "flow_scope_not_admitted"
+        );
+        assert_eq!(
+            handler
+                .admit("approve_projects", flow_route)
                 .unwrap_err()
                 .code,
             "flow_scope_not_admitted"

@@ -616,7 +616,7 @@ impl super::JournalWriter<'_> {
                 if op != crate::user_profile::SET_OP {
                     map.insert("generation".to_string(), json!(generation));
                     // Agent replies keep core's reply keys, which have no `noop`.
-                    if !op.starts_with("agent.") {
+                    if !op.starts_with("agent.") && op != crate::folder_approval::APPROVE_PROJECTS {
                         map.insert("noop".to_string(), json!(!action.changed));
                     }
                 }

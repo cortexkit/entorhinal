@@ -849,6 +849,8 @@ pub(crate) fn replay_binding_op(
                 params![payload.registration_epoch, seq],
             )?;
         }
+        // The preceding root events already replayed the approvals.
+        crate::folder_approval::APPROVE_PROJECTS => {}
         "unapprove_root" => {
             let payload: ApprovalPayload = serde_json::from_value(value.clone()).map_err(decode)?;
             tx.execute(

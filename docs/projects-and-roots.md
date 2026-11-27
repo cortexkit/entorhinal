@@ -81,6 +81,19 @@ folder and project (`approved <root> (project <name>, <id>)`); already approved
 roots add `(unchanged)`. `unapprove` prints `unapproved` with the same folder
 and project identity. Unapproving does not prompt.
 
+To approve several named projects together, pass more than one path:
+
+```sh
+ck projects approve ~/src/my-app ~/src/another-app
+```
+
+The command lists the folders awaiting approval and any projects that are
+already approved before showing one presence prompt. Each named project is
+counted once, up to 100 projects. There is no prompt if every project is already
+approved. If a folder cannot be approved, the command reports why and no folders
+are approved; for an unbound checkout, run `ck projects rebind <dir>` first.
+Use `--json` for the reply as JSON.
+
 For confirmation-required writes, `operator_declined` means the prompt was
 declined or expired, and `operator_presence_unavailable` means the machine or
 route cannot show the prompt. `operator_approval_stale` means the project or

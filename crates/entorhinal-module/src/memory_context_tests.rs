@@ -76,14 +76,7 @@ impl Fixture {
         }
     }
     async fn call(&self, key: RouteKey, op: &str, params: Value) -> Result<Value, String> {
-        match self
-            .handler
-            .handle_served_request(
-                &serde_json::to_vec(&json!({"method":op,"params":params})).unwrap(),
-                key,
-            )
-            .await
-        {
+        match self.outcome(key, op, params).await {
             HandlerOutcome::Response(bytes) => {
                 Ok(serde_json::from_slice::<Value>(&bytes).unwrap()["result"].clone())
             }
@@ -92,6 +85,14 @@ impl Fixture {
             }
             _ => panic!("unexpected handler outcome"),
         }
+    }
+    async fn outcome(&self, key: RouteKey, op: &str, params: Value) -> HandlerOutcome {
+        self.handler
+            .handle_served_request(
+                &serde_json::to_vec(&json!({"method":op,"params":params})).unwrap(),
+                key,
+            )
+            .await
     }
     fn count(&self) -> usize {
         self.prompt.summaries.lock().unwrap().len()
@@ -121,6 +122,28 @@ impl Fixture {
             .unwrap();
         store.bind_root(&root, "fixture").unwrap();
         root
+    }
+
+    fn batch_project(&self, id: &str, bound: bool) -> String {
+        let root = self.checkout(id);
+        let store = self.store();
+        store
+            .register(entorhinal_core::RegisterRequest {
+                project_id: Some(id.into()),
+                name: format!("Project {id}"),
+                roots: vec![root.clone()],
+                workspace_id: Some("W".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        if bound {
+            store.bind_root(&root, "fixture").unwrap();
+        }
+        root
+    }
+
+    async fn approve_projects(&self, params: Value) -> Result<Value, String> {
+        self.call(DIRECT, "approve_projects", params).await
     }
 
     fn workspace_folder(&self, name: &str) -> String {
@@ -449,6 +472,244 @@ async fn folder_presence_approve_checks_then_commits_and_unapprove_does_not_prom
     assert_eq!(approval(&store, &root), "unapproved");
 }
 
+fn batch_params(roots: &[(&str, &str)]) -> Value {
+    json!({
+        "canonicalRoots": roots.iter().map(|(_, root)| root).collect::<Vec<_>>(),
+        "expected": roots.iter().map(|(project, root)| json!({"projectId":project,"root":root})).collect::<Vec<_>>(),
+        "requestKey":"batch"
+    })
+}
+
+#[tokio::test]
+async fn folder_presence_batch_approves_three_projects_and_replays_retry() {
+    let f = Fixture::new(false);
+    let a = f.batch_project("A", true);
+    let b = f.batch_project("B", true);
+    let c = f.batch_project("C", true);
+    let store = f.store();
+    let before = store.generation().unwrap();
+    let mut params = batch_params(&[("A", &a), ("B", &b), ("C", &c)]);
+    params["canonicalRoots"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(&a));
+    let reply = f.approve_projects(params.clone()).await.unwrap();
+    assert_eq!(
+        reply,
+        json!({
+            "approved":[{"projectId":"A","name":"Project A","roots":[a]},
+                        {"projectId":"B","name":"Project B","roots":[b]},
+                        {"projectId":"C","name":"Project C","roots":[c]}],
+            "alreadyApproved":[], "generation":before + 4,
+        })
+    );
+    assert_eq!(
+        *f.prompt.summaries.lock().unwrap(),
+        ["Approve 3 project folders listed in the terminal"]
+    );
+    for root in [&a, &b, &c] {
+        assert_eq!(approval(&store, root), "approved");
+    }
+    assert_eq!(f.approve_projects(params).await.unwrap(), reply);
+    assert_eq!(f.count(), 1);
+    assert_eq!(store.generation().unwrap(), before + 4);
+    assert!(store.verify().unwrap().ok);
+    assert!(store.rebuild().unwrap().replay.ok);
+    assert_eq!(approval(&store, &b), "approved");
+}
+
+#[tokio::test]
+async fn folder_presence_batch_skips_approved_projects_and_roots_and_remains_local_on_hub() {
+    let f = Fixture::new(false);
+    let a = f.batch_project("A", true);
+    let b = f.batch_project("B", true);
+    let second = f.checkout("B-second");
+    let third = f.checkout("B-third");
+    let store = f.store();
+    for root in [&second, &third] {
+        store
+            .add_root(entorhinal_core::AddRootRequest {
+                project_id: "B".into(),
+                root: root.clone(),
+                label: None,
+                actor: None,
+            })
+            .unwrap();
+        store.bind_root(root, "fixture").unwrap();
+    }
+    for root in [&a, &b] {
+        store.approve_root(root, "fixture").unwrap();
+    }
+    store
+        .apply_entry("identity_log.enable", "{}", "fixture", None, |tx| {
+            tx.execute(
+                "UPDATE identity_log_state SET state='enabled', hub_log_base=0, hub_ready=1",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let before = store.generation().unwrap();
+    let mut params = batch_params(&[("B", &second), ("B", &third)]);
+    params["canonicalRoots"] = json!([a, b]);
+    let reply = f.approve_projects(params.clone()).await.unwrap();
+    assert_eq!(
+        reply,
+        json!({"approved":[{"projectId":"B","name":"Project B","roots":[second,third]}],
+        "alreadyApproved":[{"projectId":"A","name":"Project A"}],"generation":before+3})
+    );
+    assert_eq!(
+        *f.prompt.summaries.lock().unwrap(),
+        ["Approve 2 project folders listed in the terminal"]
+    );
+    let shared: i64 = rusqlite::Connection::open(f.dir.join("store.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM registry_journal WHERE seq>?1 AND stream='shared'",
+            [before],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(shared, 0);
+    assert_eq!(f.approve_projects(params.clone()).await.unwrap(), reply);
+    params["expected"] = json!([]);
+    params["requestKey"] = json!("nothing-to-do");
+    let noop = json!({"approved":[],"alreadyApproved":[{"projectId":"A","name":"Project A"},
+        {"projectId":"B","name":"Project B"}],"generation":before+3});
+    assert_eq!(f.approve_projects(params.clone()).await.unwrap(), noop);
+    assert_eq!(f.approve_projects(params).await.unwrap(), noop);
+    assert_eq!(f.count(), 1);
+    assert_eq!(store.generation().unwrap(), before + 3);
+}
+
+#[tokio::test]
+async fn folder_presence_batch_names_all_blocked_folders_without_prompting() {
+    let f = Fixture::new(false);
+    let a = f.batch_project("A", true);
+    let b = f.batch_project("B", false);
+    let c = f.batch_project("C", false);
+    std::fs::remove_dir_all(std::path::Path::new(&c).join(".git")).unwrap();
+    let store = f.store();
+    let before = store.generation().unwrap();
+    let mut params = batch_params(&[("A", &a)]);
+    params["canonicalRoots"] = json!([a, b, c]);
+    let HandlerOutcome::Error { code, message, .. } =
+        f.outcome(DIRECT, "approve_projects", params).await
+    else {
+        panic!("expected a refusal")
+    };
+    assert_eq!(code, "root_not_bound");
+    assert!(message.contains(&format!("{b:?} is unbound")), "{message}");
+    assert!(
+        message.contains(&format!("{c:?} is unverifiable")),
+        "{message}"
+    );
+    assert_eq!(f.count(), 0);
+    assert_eq!(store.generation().unwrap(), before);
+    assert_eq!(approval(&store, &a), "unapproved");
+}
+
+#[tokio::test]
+async fn folder_presence_batch_decline_writes_nothing() {
+    let f = Fixture::new(true);
+    let a = f.batch_project("A", true);
+    let b = f.batch_project("B", true);
+    let store = f.store();
+    let before = store.generation().unwrap();
+    assert_eq!(
+        f.approve_projects(batch_params(&[("A", &a), ("B", &b)]))
+            .await
+            .unwrap_err(),
+        "operator_declined"
+    );
+    assert_eq!(f.count(), 1);
+    assert_eq!(store.generation().unwrap(), before);
+    assert_eq!(approval(&store, &a), "unapproved");
+    assert_eq!(approval(&store, &b), "unapproved");
+}
+
+#[tokio::test]
+async fn folder_presence_batch_stale_in_one_project_writes_nothing_in_either() {
+    let f = Fixture::new(false);
+    let a = f.batch_project("A", true);
+    let b = f.batch_project("B", true);
+    let store = f.store();
+    let before = store.generation().unwrap();
+    let marker = std::path::Path::new(&b).join(".git/cortexkit-root-incarnation");
+    *f.prompt.on_prompt.lock().unwrap() =
+        Some(Box::new(move || std::fs::remove_file(marker).unwrap()));
+    assert_eq!(
+        f.approve_projects(batch_params(&[("A", &a), ("B", &b)]))
+            .await
+            .unwrap_err(),
+        "operator_approval_stale"
+    );
+    assert_eq!(f.count(), 1);
+    assert_eq!(store.generation().unwrap(), before);
+    assert_eq!(approval(&store, &a), "unapproved");
+    assert_eq!(approval(&store, &b), "unapproved");
+}
+
+#[tokio::test]
+async fn folder_presence_batch_root_added_after_preview_is_refused_before_prompt() {
+    let f = Fixture::new(false);
+    let a = f.batch_project("A", true);
+    let b = f.batch_project("B", true);
+    let params = batch_params(&[("A", &a), ("B", &b)]);
+    let added = f.checkout("B-added");
+    let store = f.store();
+    store
+        .add_root(entorhinal_core::AddRootRequest {
+            project_id: "B".into(),
+            root: added.clone(),
+            label: None,
+            actor: None,
+        })
+        .unwrap();
+    store.bind_root(&added, "fixture").unwrap();
+    let before = store.generation().unwrap();
+    assert_eq!(
+        f.approve_projects(params).await.unwrap_err(),
+        "operator_approval_stale"
+    );
+    assert_eq!(f.count(), 0);
+    assert_eq!(store.generation().unwrap(), before);
+    for root in [&a, &b, &added] {
+        assert_eq!(approval(&store, root), "unapproved");
+    }
+}
+
+#[tokio::test]
+async fn folder_presence_batch_last_approval_failure_rolls_back_every_project() {
+    let f = Fixture::new(false);
+    let a = f.batch_project("A", true);
+    let b = f.batch_project("B", true);
+    let c = f.batch_project("C", true);
+    let store = f.store();
+    let before = store.generation().unwrap();
+    // Fail only after two approvals have been inserted. If each project had
+    // its own transaction, those first two approvals would survive the error.
+    rusqlite::Connection::open(f.dir.join("store.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_third_approval BEFORE INSERT ON root_approval
+         WHEN (SELECT COUNT(*) FROM root_approval) = 2
+         BEGIN SELECT RAISE(ABORT, 'test third approval failure'); END;",
+        )
+        .unwrap();
+    assert_eq!(
+        f.approve_projects(batch_params(&[("A", &a), ("B", &b), ("C", &c)]))
+            .await
+            .unwrap_err(),
+        "storage_error"
+    );
+    assert_eq!(f.count(), 1);
+    assert_eq!(store.generation().unwrap(), before);
+    for root in [&a, &b, &c] {
+        assert_eq!(approval(&store, root), "unapproved");
+    }
+}
+
 #[tokio::test]
 async fn folder_presence_replaced_checkout_is_stale_without_journal_changes() {
     let f = Fixture::new(false);
@@ -562,6 +823,7 @@ async fn folder_presence_prefrontal_mutation_admission_preserves_derived_parent(
         "approve_root",
         "unapprove_root",
         "approve_project",
+        "approve_projects",
         "unapprove_project",
         "register",
         "attach_root",

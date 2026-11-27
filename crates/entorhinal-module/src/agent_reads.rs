@@ -1958,6 +1958,7 @@ mod tests {
             "approve_root",
             "unapprove_root",
             "approve_project",
+            "approve_projects",
             "unapprove_project",
             "agent.create",
             "agent.rename",

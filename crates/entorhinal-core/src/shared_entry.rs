@@ -317,7 +317,13 @@ pub(crate) fn record_local_entry(
 ) -> rusqlite::Result<()> {
     if crate::log_schema::log_enabled(tx)?
         && before != after
-        && !matches!(op, "agent.import" | "root_key.assign" | "root_key.backfill")
+        && !matches!(
+            op,
+            "agent.import"
+                | "root_key.assign"
+                | "root_key.backfill"
+                | crate::folder_approval::APPROVE_PROJECTS
+        )
     {
         let payload: Value = serde_json::from_str(payload).map_err(decode_error)?;
         let attribution = |entry: &mut ProjectEntry| -> rusqlite::Result<()> {
