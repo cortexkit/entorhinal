@@ -242,9 +242,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-client"
-version = "0.1.16"
+version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23bcafb572e3a2cf096cf5b20134180549af5164ffa124d1b5324a2416f8c1dd"
+checksum = "c70cb368255f1f41a0a850b50eed2780e498f4d272089459f5bdb97b309737a6"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -271,9 +271,9 @@ checksum = "5a1803c6fc86dc620f26036cfe384386e282ba555fb30b4d2aca301cd436f7b2"
 
 [[package]]
 name = "cortexkit-bus-nats"
-version = "0.5.6"
+version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87a10db068ad5f20ea3e7f77bf3e34368e2a004d3f975820e1f9e00437fa34bd"
+checksum = "cf09e212ef0dd848370d2ab52b10ff1c7e34591d7aa93bb0a4a82438e0ab26cf"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -652,7 +652,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1288,7 +1288,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1505,7 +1505,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1699,7 +1699,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1974,7 +1974,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
