@@ -59,7 +59,7 @@ jobs:
           RELEASE_VERSION: ${{ steps.source.outputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 script/release/assets.py check-floor
+          python3 scripts/release/assets.py check-floor
           # The version bump lives on the release branch, not main.
           branch="release/$RELEASE_VERSION"
           if ! git merge-base --is-ancestor "$REVISION" "origin/$branch"; then
@@ -164,7 +164,7 @@ jobs:
           python-version: '3.12'
 
       - name: Build and check ck-entorhinal
-        run: bash script/release-build.sh
+        run: bash scripts/release-build.sh
 
       - name: Import Developer ID certificate
         if: runner.os == 'macOS'
@@ -199,7 +199,7 @@ jobs:
           umask 077
           printf '%s' "$APP_STORE_CONNECT_API_KEY" > "$APP_STORE_CONNECT_API_KEY_PATH"
           unset APP_STORE_CONNECT_API_KEY
-          bash script/release/macos-sign-notarize.sh target/release target/release-assets "$RELEASE_TARGET"
+          bash scripts/release/macos-sign-notarize.sh target/release target/release-assets "$RELEASE_TARGET"
 
       - name: Remove signing credentials
         if: always() && runner.os == 'macOS'
@@ -212,10 +212,10 @@ jobs:
 
       - name: Package the Linux or Windows archive
         if: runner.os != 'macOS'
-        run: python script/release/assets.py pack target/release target/release-assets "$RELEASE_TARGET"
+        run: python scripts/release/assets.py pack target/release target/release-assets "$RELEASE_TARGET"
 
       - name: Verify the packaged binary and checksum the final ZIP
-        run: python script/release/assets.py verify-target target/release-assets "$RELEASE_TARGET" "$RELEASE_VERSION" "$RELEASE_REVISION"
+        run: python scripts/release/assets.py verify-target target/release-assets "$RELEASE_TARGET" "$RELEASE_VERSION" "$RELEASE_REVISION"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -249,7 +249,7 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             flags+=(--dry-run)
           fi
-          python3 script/release/assets.py assemble built-assets release-assets "$RELEASE_VERSION" "${flags[@]}"
+          python3 scripts/release/assets.py assemble built-assets release-assets "$RELEASE_VERSION" "${flags[@]}"
 
       - uses: actions/upload-artifact@v4
         with:

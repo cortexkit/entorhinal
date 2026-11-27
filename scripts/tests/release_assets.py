@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 from zipfile import ZipFile
 
-from script.release import assets
+from scripts.release import assets
 
 
 REVISION = "a" * 40

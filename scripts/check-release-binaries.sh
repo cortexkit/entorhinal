@@ -16,7 +16,7 @@ check_release_binaries() (
     MINGW*|MSYS*|CYGWIN*) binary="$binary.exe" ;;
   esac
 
-  release_python script/release/assets.py check-binary "$binary" "$2" "$3" || exit 1
+  release_python scripts/release/assets.py check-binary "$binary" "$2" "$3" || exit 1
   if [ "$platform" = Darwin ]; then
     # Mach-O debug-map entries (OSO records) point to object files on the build machine.
     symbols=$(nm -a "$binary") || exit 1

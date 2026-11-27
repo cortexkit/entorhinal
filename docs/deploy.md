@@ -1,7 +1,7 @@
 # GitHub releases
 
 The [Release workflow](../.github/workflows/release.yml) uses
-[`script/release-build.sh`](../script/release-build.sh) to build `ck-entorhinal`
+[`scripts/release-build.sh`](../scripts/release-build.sh) to build `ck-entorhinal`
 from a clean checkout. It publishes one ZIP and one SHA-256 sidecar for each of
 `darwin-arm64`, `linux-x64`, `linux-arm64`, `windows-x64`, and `windows-arm64`, plus
 `release-manifest.json` for `ck setup`. The ZIP holds only `ck-entorhinal` (or

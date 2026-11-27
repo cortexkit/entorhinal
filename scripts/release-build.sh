@@ -5,8 +5,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 die() { printf 'release-build.sh: %s\n' "$*" >&2; exit 1; }
-# shellcheck source=script/check-release-binaries.sh
-. ./script/check-release-binaries.sh
+# shellcheck source=scripts/check-release-binaries.sh
+. ./scripts/check-release-binaries.sh
 
 revision=$(git rev-parse HEAD)
 [[ "$revision" == "${RELEASE_REVISION:-$revision}" ]] || die "expected $RELEASE_REVISION, checked out $revision"
