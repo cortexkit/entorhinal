@@ -11,10 +11,7 @@ async fn liveness_bus_wire_refusal_and_catalog_notice() {
     let (dir, _) = crate::tests::scratch_descriptor("liveness-bus-wire-ckbus");
     let mut handler = ProjectsHandler::with_runtime("liveness-bus".into(), || 7);
     let (daemon, _wire, connector) = disabled_ckbus(&mut handler, &dir).await;
-    let mut source = BusSource {
-        connector,
-        ..BusSource::default()
-    };
+    let mut source = BusSource::new(connector, handler.health.local_bus.clone());
     // Use a distinct credential cache key from live NATS tests.
     let failure = source
         .open_watch("entorhinal-wire-liveness")
@@ -25,6 +22,7 @@ async fn liveness_bus_wire_refusal_and_catalog_notice() {
     assert!(failure
         .message
         .contains(subc_protocol::error_codes::TARGET_UNAVAILABLE));
+    assert!(handler.health.local_bus.outage().is_some());
     assert_wire_catalog_wakes(&handler, &daemon).await;
     handler.provider_resolver.stop().await;
     std::fs::remove_dir_all(dir).unwrap();

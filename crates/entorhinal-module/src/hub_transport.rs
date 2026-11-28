@@ -325,10 +325,17 @@ impl Hub {
                 *bus = None;
             }
             if bus.is_none() {
+                let consumer = self.bus_consumer().await?;
                 *bus = Some(
-                    BusClient::connect(self.bus_consumer().await?, Self::bus_options())
-                        .await
-                        .map_err(Self::bus_failure)?,
+                    self.health
+                        .local_bus
+                        .connect(async {
+                            timeout_at(deadline, BusClient::connect(consumer, Self::bus_options()))
+                                .await
+                                .map_err(|_| Failure::code("bus_connect_timeout"))?
+                                .map_err(Self::bus_failure)
+                        })
+                        .await?,
                 );
             }
             bus.as_ref()

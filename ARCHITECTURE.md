@@ -141,7 +141,9 @@ All start after HELLO_ACK. Each holds the store weakly and takes a handle only f
 
 ## Health
 
-The module reports `Ok`; `Degraded` while it waits for a predecessor's lease, when the store is from another machine, when the identity log is stalled or failing, or after move errors or a move task panic; and `Failing` while the store is not open. Its metrics cover the generation, query counts and latency, `readyAfterMs`, liveness counters, identity-log state and progress, hub watches and leases, open moves, catalog polling, open watches and pending cut releases.
+The module reports `Ok`; `Degraded` while it waits for a predecessor's lease, when the store is from another machine, when the identity log is stalled or failing, after move errors or a move task panic, or when explicit connections to the local account bus have failed for at least 60 seconds (`bus_unreachable`); and `Failing` while the store is not open. Its metrics cover the generation, query counts and latency, `readyAfterMs`, liveness counters, identity-log state and progress, hub watches and leases, open moves, catalog polling, open watches and pending cut releases.
+
+The first explicit local-bus connection failure sets `busUnreachableSinceMs` (Unix milliseconds). Any successful local-bus connection clears it. Deliberate closes and failures internal to the bus SDK's automatic reconnect loop do not count. The federated hub link has separate health fields.
 
 ## Further reading
 
