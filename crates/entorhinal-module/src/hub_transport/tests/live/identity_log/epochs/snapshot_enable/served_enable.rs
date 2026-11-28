@@ -336,7 +336,8 @@ async fn hub_served_enable_starts_a_fresh_registry_without_a_prompt() {
         false,
         false,
     );
-    // A brand-new computer has prefrontal's empty import marker and nothing else.
+    // A brand-new computer holds only the `agent.cutover` marker, written by
+    // the empty agent import that the prefrontal module runs at its first start.
     fresh
         .store()
         .apply_entry("agent.cutover", "{}", "test", None, |_| Ok(()))
