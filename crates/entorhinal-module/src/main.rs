@@ -60,6 +60,7 @@ const DEFAULT_STORAGE_NAMESPACE: &str = "default";
 mod agent_ops;
 mod agent_reads;
 mod bus_changes;
+mod bus_health;
 mod catalog_agent;
 mod catalog_blob;
 mod catalog_builtin;
@@ -475,6 +476,7 @@ impl RequestLatency {
 #[derive(Default)]
 struct HealthGauges {
     hub: hub_transport::Gauges,
+    local_bus: Arc<bus_health::Tracker>,
     // 0: legacy backend, 1: waiting for the hub membership barrier, 2: ready.
     hub_membership: AtomicU64,
     hub_membership_incarnation: AtomicU64,
@@ -1399,6 +1401,8 @@ impl ModuleHandler for ProjectsHandler {
         let opening = self.health.store_opening.load(Ordering::Acquire);
         let ready = self.health.store_ready.load(Ordering::Relaxed);
         let failed = self.health.store_failed.load(Ordering::Relaxed);
+        let bus_outage = self.health.local_bus.outage();
+        let bus_unreachable = bus_outage.as_ref().is_some_and(|outage| outage.degraded);
         let status = if opening {
             HealthStatus::Degraded
         } else if failed || !ready {
@@ -1409,6 +1413,7 @@ impl ModuleHandler for ProjectsHandler {
             || self.health.move_errors.load(Ordering::Relaxed) != 0
             || self.health.move_inbox_rejected.load(Ordering::Relaxed) != 0
             || self.health.move_task_panics.load(Ordering::Relaxed) != 0
+            || bus_unreachable
         {
             HealthStatus::Degraded
         } else {
@@ -1421,6 +1426,8 @@ impl ModuleHandler for ProjectsHandler {
                 || "projects storage is not ready".to_string(),
                 |refusal| format!("store_failed: {}: {}", refusal.code, refusal.message),
             ))
+        } else if !failed && bus_unreachable {
+            Some("bus_unreachable".to_string())
         } else {
             None
         };
@@ -1475,6 +1482,9 @@ impl ModuleHandler for ProjectsHandler {
             }))))))),
         };
         if let Some(metrics) = report.metrics.as_mut() {
+            if let Some(outage) = bus_outage {
+                metrics["busUnreachableSinceMs"] = json!(outage.since_ms);
+            }
             self.health.hub.report(metrics);
             metrics["roleLeasesHeld"] = json!(self.role_leases.held());
             metrics["providerCacheHits"] = json!(providers.hits);

@@ -197,15 +197,28 @@ pub(super) trait Source: Send {
     async fn next(&mut self) -> Result<Delivery, Failure>;
 }
 
-#[derive(Default)]
 struct BusSource {
     connector: super::log_client::SubcConnector,
+    reachability: Arc<super::bus_health::Tracker>,
     client: Option<BusClient>,
     changes: Option<tokio::sync::watch::Receiver<u64>>,
     watch: Option<BucketWatch>,
 }
 
 impl BusSource {
+    fn new(
+        connector: super::log_client::SubcConnector,
+        reachability: Arc<super::bus_health::Tracker>,
+    ) -> Self {
+        Self {
+            connector,
+            reachability,
+            client: None,
+            changes: None,
+            watch: None,
+        }
+    }
+
     async fn open_watch(&mut self, module_id: &str) -> Result<(), Failure> {
         self.watch = None;
         if let Some(changes) = &mut self.changes {
@@ -226,12 +239,13 @@ impl BusSource {
                 .consumer()
                 .await
                 .map_err(|e| Failure::new("credential", format!("{e:?}")))?;
-            let client = BusClient::connect(
-                consumer,
-                BusClientOptions::new(module_id).map_err(|e| Failure::new("options", e))?,
-            )
-            .await
-            .map_err(Failure::connect)?;
+            let options =
+                BusClientOptions::new(module_id).map_err(|e| Failure::new("options", e))?;
+            let client = self
+                .reachability
+                .connect(BusClient::connect(consumer, options))
+                .await
+                .map_err(Failure::connect)?;
             self.changes = Some(client.connection_changes());
             self.client = Some(client);
         }
@@ -416,10 +430,7 @@ impl ProjectsHandler {
         }
         let mut task = self.liveness_bus_task.lock().unwrap();
         if task.is_none() {
-            let source = BusSource {
-                connector,
-                ..BusSource::default()
-            };
+            let source = BusSource::new(connector, self.health.local_bus.clone());
             *task = Some(tokio::spawn(self.liveness_bus_worker().run(source)));
         }
     }

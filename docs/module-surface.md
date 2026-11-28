@@ -58,7 +58,7 @@ the first successful store-open time from process start. Requests slower than
 500 ms also emit one fleet warning; a `resolve` warning includes its
   `canonical_root`.
 
-The health shape is unchanged. The following fields no longer change:
+The following fields no longer change:
 
 | Value | Metric keys |
 |---|---|
@@ -82,6 +82,16 @@ described below and placement facts).
 checkpoint; `placementFactsUnpublished` counts current facts still awaiting one.
 Checkpoints whose facts no longer exist do not count. All are cached atomics;
 a bus outage never delays health or registry reads.
+
+After 60 seconds since the first failed explicit connection to the local
+account bus, with no successful connection since, health reports `Degraded`
+with detail `bus_unreachable` unless a store detail takes precedence. The
+`busUnreachableSinceMs` metric gives the first failure's Unix timestamp in
+milliseconds, even during the 60-second grace period. Any successful local
+connection clears the streak and omits the metric. Deliberate closes do not
+start a streak, and failures inside the bus SDK's automatic reconnect loop
+are not visible to the module. The federated hub is still reported separately,
+including `hubConnected` and `hubResetBucket`.
 
 ## Bus change markers
 

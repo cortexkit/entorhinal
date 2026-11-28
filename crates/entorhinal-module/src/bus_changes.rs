@@ -102,15 +102,28 @@ pub(super) trait Sink: Send {
     async fn connection_changed(&mut self);
 }
 
-#[derive(Default)]
 struct BusSink {
     connector: super::log_client::SubcConnector,
+    reachability: Arc<super::bus_health::Tracker>,
     client: Option<BusClient>,
     changes: Option<watch::Receiver<u64>>,
     register: Option<NatsRegister>,
 }
 
 impl BusSink {
+    fn new(
+        connector: super::log_client::SubcConnector,
+        reachability: Arc<super::bus_health::Tracker>,
+    ) -> Self {
+        Self {
+            connector,
+            reachability,
+            client: None,
+            changes: None,
+            register: None,
+        }
+    }
+
     async fn client(&mut self) -> Result<&BusClient, Failure> {
         self.client_for(super::MODULE_ID).await
     }
@@ -135,12 +148,12 @@ impl BusSink {
                 .consumer()
                 .await
                 .map_err(|e| format!("{e:?}"))?;
-            let client = BusClient::connect(
-                consumer,
-                BusClientOptions::new(module_id).map_err(|e| e.to_string())?,
-            )
-            .await
-            .map_err(Failure::connect)?;
+            let options = BusClientOptions::new(module_id).map_err(|e| e.to_string())?;
+            let client = self
+                .reachability
+                .connect(BusClient::connect(consumer, options))
+                .await
+                .map_err(Failure::connect)?;
             self.changes = Some(client.connection_changes());
             self.client = Some(client);
         }
@@ -246,10 +259,10 @@ impl ProjectsHandler {
         let mut task = self.bus_changes_task.lock().unwrap();
         if task.is_none() {
             let worker = self.bus_changes_worker();
-            let sink = BusSink {
-                connector: super::log_client::SubcConnector::from_args(std::env::args_os().skip(1)),
-                ..BusSink::default()
-            };
+            let sink = BusSink::new(
+                super::log_client::SubcConnector::from_args(std::env::args_os().skip(1)),
+                self.health.local_bus.clone(),
+            );
             *task = Some(tokio::spawn(worker.run(sink)));
         }
     }
@@ -687,10 +700,7 @@ pub(super) mod tests {
         let (dir, _) = crate::tests::scratch_descriptor("bus-changes-wire-ckbus");
         let mut handler = ProjectsHandler::with_runtime("bus-changes".into(), || 7);
         let (daemon, _wire, connector) = disabled_ckbus(&mut handler, &dir).await;
-        let mut sink = BusSink {
-            connector,
-            ..BusSink::default()
-        };
+        let mut sink = BusSink::new(connector, handler.health.local_bus.clone());
         // The bus client shares credentials by module id across the process.
         let failure = sink
             .client_for("entorhinal-wire-publisher")
@@ -701,6 +711,7 @@ pub(super) mod tests {
         assert!(failure
             .message
             .contains(subc_protocol::error_codes::TARGET_UNAVAILABLE));
+        assert!(handler.health.local_bus.outage().is_some());
         assert_wire_catalog_wakes(&handler, &daemon).await;
         handler.provider_resolver.stop().await;
         std::fs::remove_dir_all(dir).unwrap();
