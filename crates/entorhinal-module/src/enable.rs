@@ -157,24 +157,34 @@ impl ProjectsHandler {
         if switch.head(deadline).await? > 0 {
             return switch.finish(&runtime, deadline).await;
         }
-        sql.run(deadline, "check_enable_preconditions", move |store| {
-            store.check_enable_preconditions(0)?;
-            Ok(store.check_agent_import_preconditions(without_agents)?)
-        })
-        .await?;
-        let mut confirmation = agent_ops::ConfirmationGuard::take(&self.confirmation_slot, key)?;
-        if !self.route_admissions().contains_key(&key) {
-            return Err(agent_ops::OperatorConfirmError::Declined.into());
-        }
-        let summary = "Start a new shared registry for this account?";
-        tokio::select! {
-            biased;
-            _ = confirmation.cancelled.wait_for(|closed| *closed) => return Err(agent_ops::OperatorConfirmError::Declined.into()),
-            result = timeout_at(received + shared_write::OPERATOR_BOUND, self.operator_confirmer.confirm_operator(summary, key)) => {
-                result.map_err(|_| HandlerError::from(agent_ops::OperatorConfirmError::Declined))??;
+        let fresh = sql
+            .run(deadline, "check_enable_preconditions", move |store| {
+                store.check_enable_preconditions(0)?;
+                store.check_agent_import_preconditions(without_agents)?;
+                Ok(store.enable_registry_is_empty()?)
+            })
+            .await?;
+        // A brand-new computer starts its registry without a second prompt,
+        // because setup's own confirmation already covers it. The case is
+        // narrow: no saved plan, an empty hub log (head 0, checked above) and
+        // no project, workspace or agent here, so starting shares or loses
+        // nothing. Any other start keeps the presence prompt; joining an
+        // existing log never prompts.
+        if !fresh {
+            let mut confirmation =
+                agent_ops::ConfirmationGuard::take(&self.confirmation_slot, key)?;
+            if !self.route_admissions().contains_key(&key) {
+                return Err(agent_ops::OperatorConfirmError::Declined.into());
+            }
+            let summary = "Start a new shared registry for this account?";
+            tokio::select! {
+                biased;
+                _ = confirmation.cancelled.wait_for(|closed| *closed) => return Err(agent_ops::OperatorConfirmError::Declined.into()),
+                result = timeout_at(received + shared_write::OPERATOR_BOUND, self.operator_confirmer.confirm_operator(summary, key)) => {
+                    result.map_err(|_| HandlerError::from(agent_ops::OperatorConfirmError::Declined))??;
+                }
             }
         }
-        drop(confirmation);
         let deadline = Instant::now() + super::catch_up::READ_DEADLINE;
         if switch.head(deadline).await? > 0 {
             return switch.finish(&runtime, deadline).await;

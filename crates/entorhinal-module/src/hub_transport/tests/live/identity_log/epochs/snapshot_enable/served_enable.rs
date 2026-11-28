@@ -171,6 +171,16 @@ fn refused(outcome: HandlerOutcome, expected: &str) {
     );
 }
 
+/// Give a store one workspace, so its registry is not brand-new.
+fn add_workspace(store: &RegistryStore) {
+    store
+        .apply_entry("fixture.workspace", "{}", "test", None, |tx| {
+            tx.execute("INSERT INTO workspace(workspace_id,name,created_at,updated_at) VALUES('ws','ws',0,0)", [])?;
+            Ok(())
+        })
+        .unwrap();
+}
+
 fn pair_fleet(rig: &IdentityRig) -> Arc<Fleet> {
     let fleet = Arc::new(Fleet::default());
     roster(&fleet, rig, &[A, B]);
@@ -211,6 +221,9 @@ async fn hub_served_enable_guards() {
         false,
         false,
     );
+    // A workspace makes the registry non-empty, so starting it still needs the
+    // presence prompt this machine declines.
+    add_workspace(&denied.store());
     let before = denied.store().generation().unwrap();
     refused(denied.enable(json!({})).await, "agents_not_imported");
     assert_eq!(denied.requests.count("consent"), 0);
@@ -248,6 +261,8 @@ async fn hub_served_enable_guards() {
         true,
         true,
     );
+    // Only a non-empty registry prompts; the race needs a prompt held open.
+    add_workspace(&pending.store());
     let race = tokio::spawn({
         let pending = pending.handler.clone();
         async move {
@@ -272,12 +287,12 @@ async fn hub_served_enable_guards() {
     assert_eq!(leader.requests.count("consent"), 1);
     leader.requests.assert_allowed();
 
+    // Another computer started the registry while this prompt was open. Holding
+    // a workspace, this computer can't join it, and must not start a second
+    // registry either.
     pending.prompt.release.as_ref().unwrap().notify_one();
-    assert_eq!(result(within(race).await.unwrap())["state"], "enabled");
-    assert_eq!(
-        pending.store().installed_hub_snapshot().unwrap(),
-        leader.store().installed_hub_snapshot().unwrap()
-    );
+    refused(within(race).await.unwrap(), "join_requires_empty_registry");
+    assert_eq!(pending.store().hub_log_base().unwrap(), None);
     assert!(pending.store().hub_enable_plan().unwrap().is_none());
     assert_eq!(leader.log.log_head(deadline()).await.unwrap(), head);
     assert_eq!(pending.requests.count("hub.prepare"), 0);
@@ -305,6 +320,36 @@ async fn hub_served_enable_guards() {
     assert_eq!(nonempty.requests.count("consent"), 0);
     assert_eq!(leader.log.log_head(deadline()).await.unwrap(), head);
     nonempty.requests.assert_allowed();
+}
+
+#[tokio::test]
+async fn hub_served_enable_starts_a_fresh_registry_without_a_prompt() {
+    let Some(rig) = empty_rig().await else {
+        return;
+    };
+    // This machine declines every prompt, so enabling proves none was shown.
+    let fresh = Machine::new(
+        &rig,
+        store(&rig._processes, "enable-fresh"),
+        &pair_fleet(&rig),
+        true,
+        false,
+        false,
+    );
+    // A brand-new computer has prefrontal's empty import marker and nothing else.
+    fresh
+        .store()
+        .apply_entry("agent.cutover", "{}", "test", None, |_| Ok(()))
+        .unwrap();
+    assert_eq!(fresh.log.log_head(deadline()).await.unwrap(), 0);
+    assert_eq!(result(fresh.enable(json!({})).await)["state"], "enabled");
+    assert_eq!(fresh.requests.count("consent"), 0);
+    assert!(fresh.log.log_head(deadline()).await.unwrap() > 0);
+    let before = fresh.store().generation().unwrap();
+    assert_eq!(result(fresh.enable(json!({})).await)["state"], "enabled");
+    assert_eq!(fresh.store().generation().unwrap(), before);
+    assert_eq!(fresh.requests.count("consent"), 0);
+    fresh.requests.assert_allowed();
 }
 
 #[tokio::test]
@@ -467,6 +512,8 @@ async fn log_enable_cli_request_enables_through_operator_route() {
         true,
         false,
     );
+    // A non-empty registry, so the CLI path goes through the presence prompt.
+    add_workspace(&a.store());
     let wire = crate::cli::project_log_test_wire(&["log", "enable", "--without-agents"]);
     assert_eq!(
         result(a.handler.handle_served_request(&wire, ROUTE).await)["state"],

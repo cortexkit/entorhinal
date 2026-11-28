@@ -37,6 +37,9 @@ Reads local state only: the sharing state, `lastAppliedPosition`,
 
    Confirm the presence prompt. On an empty hub, this writes a snapshot of this
    machine's shared registry. Declining leaves sharing off and publishes nothing.
+   A brand-new machine (no projects, workspaces or agents, and an empty hub)
+   starts its registry without the prompt, because setup's own confirmation
+   covers it; `ck setup` runs this step itself.
 
 Refusals, all before anything changes:
 
